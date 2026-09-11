@@ -706,9 +706,20 @@ function git(args, options = {}) {
   });
 }
 
+export const STAGED_DIFF_FILTER = "ACMRT";
+
 function stagedFiles() {
   // -z emits raw NUL-delimited paths (no quoting/escaping), so no core.quotePath needed.
-  const out = git(["diff", "--cached", "-z", "--name-only", "--diff-filter=ACMR"]);
+  //
+  // T (type-changed) matters as much as the rest: replacing a tracked symlink
+  // with a regular file leaves the new content fully staged, but git reports it
+  // as T, so leaving T out of the filter made that file invisible to every rule
+  // - a complete bypass of the scanner, not a weakened one (issue #80).
+  //
+  // D is still excluded because a deletion stages no content to scan, and U
+  // (unmerged) because git refuses to commit a conflicted path in the first
+  // place, so the hook never has to judge one.
+  const out = git(["diff", "--cached", "-z", "--name-only", `--diff-filter=${STAGED_DIFF_FILTER}`]);
   return out.toString("utf8").split("\0").filter(Boolean);
 }
 
