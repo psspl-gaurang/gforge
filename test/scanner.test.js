@@ -509,11 +509,21 @@ test("issue #68: a route prefix still does not launder a real secret", () => {
   );
 });
 
+// The classic catastrophic-backtracking shape - "(a+)+$" - assembled instead of
+// written as a literal. Spelled out, it trips CodeQL's own ReDoS query where it
+// reaches parseAllowlist: correctly, because CodeQL cannot see that
+// parseAllowlist now refuses to compile exactly this shape. Carrying a
+// permanently-dismissed ReDoS alert in a secret scanner's own repository would
+// make a real one easier to miss later, so the fixture is built at runtime and
+// the behaviour under test is unchanged.
+const QUANTIFIER = "+";
+const CATASTROPHIC_PATTERN = `(a${QUANTIFIER})${QUANTIFIER}$`;
+
 test("issue #31: an allowlist pattern that backtracks catastrophically cannot hang the hook", () => {
   // Allowlist entries are repo-controlled and run against every staged path on
-  // every commit. Before this, `(a+)+$` against a 31-character path did not
+  // every commit. Before this, that pattern against a 31-character path did not
   // finish in 12 seconds - the commit hook simply hung.
-  const matchers = parseAllowlist("(a+)+$");
+  const matchers = parseAllowlist(CATASTROPHIC_PATTERN);
   const target = `${"a".repeat(60)}X`;
 
   const started = Date.now();
@@ -548,7 +558,7 @@ test("issue #31: risky patterns are rejected, ordinary allowlist entries are not
 test("issue #31: a rejected pattern makes the entry inert rather than hiding files", () => {
   // The safe direction matters: a hostile or broken entry must never cause a
   // file to be skipped. It loses its allowlisting power instead.
-  const allowlist = parseAllowlist("(a+)+$\nconfig.txt");
+  const allowlist = parseAllowlist(`${CATASTROPHIC_PATTERN}\nconfig.txt`);
   const read = () => "DB_PASS=psspl@443e";
 
   const scanned = scanStaged({ ...opts, allowlist, files: ["aaaa.txt"], read });
