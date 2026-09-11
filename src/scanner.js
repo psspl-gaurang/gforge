@@ -1143,6 +1143,38 @@ function updateLogPath() {
   return join(homedir(), ".gforge", "update-log");
 }
 
+// The engine the hook will actually run next time. Path is spelled out rather
+// than imported: this file is copied standalone into ~/.gforge/hooks and may
+// only use Node built-ins.
+function installedEnginePath() {
+  return join(homedir(), ".gforge", "hooks", "gforge-scan.mjs");
+}
+
+// The version baked into an engine file at install time. getScannerContent()
+// substitutes the placeholder, so the installed copy carries a literal.
+export function parseEngineVersion(content) {
+  const match = /const RUNNING_VERSION = "([^"]+)"/.exec(String(content ?? ""));
+  const version = match ? match[1] : null;
+  // An un-substituted placeholder means a source checkout, not an install.
+  return version && version[0] !== "_" ? version : null;
+}
+
+// Was the update real? npm exiting 0 only says the package landed; the engine
+// version on disk says whether the hook the next commit runs was refreshed.
+export function describeUpdateOutcome({ code, onDisk, version }) {
+  if (code !== 0) return { refreshed: false, outcome: `failed(exit=${code})` };
+  if (onDisk === version) return { refreshed: true, outcome: "installed" };
+  return { refreshed: false, outcome: `installed-but-hooks-stale(onDisk=${onDisk ?? "unknown"})` };
+}
+
+function readInstalledEngineVersion() {
+  try {
+    return parseEngineVersion(readFileSync(installedEnginePath(), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 function updateLockPath() {
   return join(homedir(), ".gforge", "update.lock");
 }
@@ -1453,6 +1485,21 @@ function maybeUpdateNotice(write) {
       }
     }
 
+    // The package updated but the hook files did not, so the engine running
+    // this very commit is still the old one. verify would catch it, but nobody
+    // runs verify on a schedule - and staying quiet about it is precisely what
+    // made this silent (issue #83).
+    if (known && cache?.hooksStale) {
+      const c = makePalette(colorEnabled(process.stderr));
+      write(
+        `\n${c.redBold(
+          `gforge: updated to v${cache.hooksStale.expected} but the managed hook is still v${
+            cache.hooksStale.onDisk ?? "unknown"
+          } - scanning is running old rules. Run \`gforge update\` to refresh it.`
+        )}\n`
+      );
+    }
+
     if (known && cache) {
       const settings = resolveAutoUpdateSettings({ fileContent: readSettingsFile(), env: process.env });
       const major = describeMajorNotice({
@@ -1587,13 +1634,33 @@ async function runUpdateCheckLocked() {
     });
     const code = await new Promise((resolve) => npm.on("close", resolve).on("error", () => resolve(-1)));
     const stamp = new Date().toISOString();
-    appendUpdateLog(
-      `${stamp} ${code === 0 ? "installed" : `failed(exit=${code})`} ${target.tier} ${RUNNING_VERSION} -> ${target.version}`
-    );
+
+    // A zero exit from `npm install -g` is not the same as "the update took
+    // effect". npm can install the package and still never run its postinstall
+    // - ignore-scripts in .npmrc or npm_config_ignore_scripts, or a postinstall
+    // that fails without npm propagating it - and refreshing ~/.gforge/hooks is
+    // exactly what that step does. The engine the next commit actually runs
+    // would then stay on the old version indefinitely while the log and cache
+    // both claimed success (issue #83).
+    //
+    // So confirm against the artifact that matters: the version baked into the
+    // engine file on disk.
+    const onDisk = code === 0 ? readInstalledEngineVersion() : null;
+    const { refreshed, outcome } = describeUpdateOutcome({ code, onDisk, version: target.version });
+    appendUpdateLog(`${stamp} ${outcome} ${target.tier} ${RUNNING_VERSION} -> ${target.version}`);
+
     if (code === 0) {
       try {
         const cache = JSON.parse(readFileSync(updateCachePath(), "utf8"));
-        cache.installed = { from: RUNNING_VERSION, to: target.version, at: Date.now(), tier: target.tier };
+        if (refreshed) {
+          cache.installed = { from: RUNNING_VERSION, to: target.version, at: Date.now(), tier: target.tier };
+          delete cache.hooksStale;
+        } else {
+          // Recorded so the next commit can say so out loud. Claiming success
+          // here is what made this silent in the first place.
+          cache.hooksStale = { expected: target.version, onDisk: onDisk ?? null, at: Date.now() };
+          delete cache.installed;
+        }
         writeFileSync(updateCachePath(), `${JSON.stringify(cache)}\n`);
       } catch {
         // ignore
