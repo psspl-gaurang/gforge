@@ -4,9 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { installManagedHooks, uninstallManagedHooks, updateManagedHooks, verifyManagedHooks } from "../src/installer.js";
 import {
+  hookInvokesScanner,
+  installManagedHooks,
+  uninstallManagedHooks,
+  updateManagedHooks,
+  verifyManagedHooks
+} from "../src/installer.js";
+import {
+  PRE_COMMIT_FILE_NAME,
   SCANNER_FILE_NAME,
+  buildPreCommitHook,
   getScannerContent,
   resolveHooksDirectory,
   resolveManagedDirectory,
@@ -454,6 +462,64 @@ test("issue #39: concurrent installs cannot splice the managed files together", 
   // And no temp debris survives the race.
   const leftover = (await readdir(resolveHooksDirectory(homePath))).filter((n) => n.includes("gforge-tmp"));
   assert.deepEqual(leftover, []);
+});
+
+test("issue #82: a no-op hook that merely mentions the scanner does not verify", async () => {
+  // The reported bypass. The old check was
+  // `includes(SCANNER_FILE_NAME) && includes("exec")`, which this satisfies
+  // while running nothing - and because the engine file itself is compared
+  // byte-for-byte and was untouched, verify reported the whole thing healthy.
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  await writeFile(resolvePreCommitPath(homePath), "#!/bin/sh\n# exec gforge-scan.mjs\nexit 0\n");
+
+  const report = await verifyManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  const shim = report.checks.find((check) => check.label === `${PRE_COMMIT_FILE_NAME}-content`);
+  assert.equal(shim.status, "FAIL");
+  assert.match(shim.detail, /modified|does not delegate/);
+});
+
+test("issue #82: an untouched install still verifies, and any edit to the hook is caught", async () => {
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  const path = resolvePreCommitPath(homePath);
+  const original = await readFile(path, "utf8");
+
+  const shimCheck = async () => {
+    const report = await verifyManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+    return report.checks.find((check) => check.label === `${PRE_COMMIT_FILE_NAME}-content`);
+  };
+
+  assert.equal((await shimCheck()).status, "PASS");
+
+  // Neutering the invocation while leaving everything else intact.
+  await writeFile(path, original.replace('exec "$NODE" "$SCANNER" pre-commit', "exit 0"));
+  assert.equal((await shimCheck()).status, "FAIL");
+
+  await writeFile(path, original);
+  assert.equal((await shimCheck()).status, "PASS");
+});
+
+test("issue #82: the structural fallback still requires a real invocation", () => {
+  // Used when an install's state file predates the recorded node path, so the
+  // exact comparison is not available. Weaker than byte equality, but it must
+  // not accept a hook that only talks about the scanner.
+  assert.equal(hookInvokesScanner(buildPreCommitHook("/usr/bin/node")), true);
+
+  assert.equal(hookInvokesScanner("#!/bin/sh\n# exec gforge-scan.mjs\nexit 0\n"), false);
+  assert.equal(hookInvokesScanner('#!/bin/sh\n# SCANNER="gforge-scan.mjs"; exec "$SCANNER"\nexit 0\n'), false);
+  // Half-measures fail too: an exec with nothing resolving the scanner path,
+  // and a resolved path that is never executed.
+  assert.equal(hookInvokesScanner('#!/bin/sh\nexec "$NODE" "$SCANNER"\n'), false);
+  assert.equal(hookInvokesScanner('#!/bin/sh\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\nexit 0\n'), false);
+  // A trailing comment on a genuine exec line is still a genuine exec line.
+  assert.equal(
+    hookInvokesScanner('#!/bin/sh\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\nexec "$NODE" "$SCANNER" pre-commit # go\n'),
+    true
+  );
 });
 
 test("verify warns when a repo-local hooks path shadows the managed hooks", async () => {
