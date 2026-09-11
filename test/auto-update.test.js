@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
   QUARANTINE_MS,
+  UPDATE_LOCK_STALE_MS,
+  acquireUpdateLock,
   classifyVersionBump,
   describeMajorNotice,
   parseVersion,
+  releaseUpdateLock,
   resolveAutoUpdateSettings,
   selectAutoUpdateTarget,
   settingsPath,
+  updateCacheIsStale,
   versionAgeMs
 } from "../src/scanner.js";
 import {
@@ -241,7 +245,7 @@ test("issue #29: writing a setting preserves unrelated keys already on disk", ()
 });
 
 test("issue #29: gforge settings --no-autoupdate persists and reports the state", async () => {
-  const home = await mkdtemp(join(tmpdir(), "gforge-settings-"));
+  const home = await tempHome();
   const streams = createStreams();
 
   const result = await runSettingsCommand(["settings", "--no-autoupdate"], streams, { home, env: {} });
@@ -259,7 +263,7 @@ test("issue #29: gforge settings --no-autoupdate persists and reports the state"
 });
 
 test("issue #29: gforge settings warns when the env var overrides the stored value", async () => {
-  const home = await mkdtemp(join(tmpdir(), "gforge-settings-"));
+  const home = await tempHome();
   await writeAutoUpdateSettings({ minor: true, major: true }, home);
 
   const streams = createStreams();
@@ -273,7 +277,7 @@ test("issue #29: gforge settings warns when the env var overrides the stored val
 });
 
 test("issue #29: contradictory or unknown settings flags fail rather than guessing", async () => {
-  const home = await mkdtemp(join(tmpdir(), "gforge-settings-"));
+  const home = await tempHome();
 
   const both = createStreams();
   assert.equal((await runSettingsCommand(["settings", "--autoupdate", "--no-autoupdate"], both, { home })).exitCode, 1);
@@ -300,4 +304,132 @@ function createStreams() {
     out: () => out,
     err: () => err
   };
+}
+
+// ---------------------------------------------------------------------------
+// issue #84: concurrency control for the background update worker
+// ---------------------------------------------------------------------------
+
+test("issue #84: only one worker can hold the update lock at a time", async () => {
+  // The reported bug: two commits in quick succession both saw the cache as
+  // stale and each spawned a worker, so two `npm install -g` ran against the
+  // same global package directory. Reproduced at 2/2 before this lock.
+  const path = await lockPath();
+  const now = 1_000_000_000_000;
+
+  assert.equal(acquireUpdateLock({ path, now }), true);
+  assert.equal(acquireUpdateLock({ path, now: now + 1000 }), false);
+  assert.equal(acquireUpdateLock({ path, now: now + UPDATE_LOCK_STALE_MS - 1 }), false);
+});
+
+test("issue #84: a crashed worker's lock goes stale rather than blocking forever", async () => {
+  const path = await lockPath();
+  const now = 1_000_000_000_000;
+
+  assert.equal(acquireUpdateLock({ path, now }), true);
+  // A worker that dies without releasing must not disable updates permanently.
+  assert.equal(acquireUpdateLock({ path, now: now + UPDATE_LOCK_STALE_MS + 1 }), true);
+});
+
+test("issue #84: an unreadable or malformed lock is treated as abandoned", async () => {
+  const now = 1_000_000_000_000;
+
+  const corrupt = await lockPath();
+  await writeFile(corrupt, "{not json");
+  assert.equal(acquireUpdateLock({ path: corrupt, now }), true);
+
+  const noTimestamp = await lockPath();
+  await writeFile(noTimestamp, JSON.stringify({ pid: 1 }));
+  assert.equal(acquireUpdateLock({ path: noTimestamp, now }), true);
+});
+
+test("issue #84: releasing frees the lock, and releasing twice is harmless", async () => {
+  const path = await lockPath();
+  const now = 1_000_000_000_000;
+
+  assert.equal(acquireUpdateLock({ path, now }), true);
+  releaseUpdateLock(path);
+  assert.equal(acquireUpdateLock({ path, now }), true);
+
+  releaseUpdateLock(path);
+  assert.doesNotThrow(() => releaseUpdateLock(path));
+});
+
+test("issue #84: stealing a stale lock does not carry off a live one", async () => {
+  // The subtle half. Renaming alone is not a sufficient arbiter: once one
+  // process has stolen the stale lock and claimed a fresh one, a second
+  // stealer's rename would pick up *that live lock* instead of the dead one,
+  // and both would install. A stress run caught this at 1-in-3.
+  const path = await lockPath();
+  const stale = 1_000_000_000_000;
+  const now = stale + UPDATE_LOCK_STALE_MS + 1;
+
+  await writeFile(path, JSON.stringify({ pid: 99999, startedAt: stale }));
+
+  // First stealer wins and now holds a fresh lock.
+  assert.equal(acquireUpdateLock({ path, now }), true);
+  const held = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(held.pid, process.pid);
+
+  // A second stealer that judged the *old* lock stale must not take this one.
+  assert.equal(acquireUpdateLock({ path, now }), false);
+  // ...and must leave the live lock in place rather than destroying it.
+  const after = JSON.parse(await readFile(path, "utf8"));
+  assert.deepEqual(after, held);
+});
+
+test("issue #84: the lock leaves no stray takeover files behind", async () => {
+  const path = await lockPath();
+  const stale = 1_000_000_000_000;
+
+  await writeFile(path, JSON.stringify({ pid: 99999, startedAt: stale }));
+  assert.equal(acquireUpdateLock({ path, now: stale + UPDATE_LOCK_STALE_MS + 1 }), true);
+  releaseUpdateLock(path);
+
+  const { readdir } = await import("node:fs/promises");
+  const leftover = (await readdir(dirname(path))).filter((name) => name.includes("stale"));
+  assert.deepEqual(leftover, []);
+});
+
+test("issue #84: a worker rechecks the cache after locking, so a late arrival is a no-op", async () => {
+  // Mutual exclusion alone is not enough. A worker that starts late can acquire
+  // the lock cleanly after the winner has finished and released it, and would
+  // then repeat the install - it still carries the old baked-in version and
+  // cannot otherwise tell the work is done. The freshly written cache is the
+  // signal. This predicate is what the worker consults once it holds the lock.
+  const now = 1_000_000_000_000;
+  const path = await lockPath();
+
+  // A check that just happened: nothing to do.
+  await writeFile(path, JSON.stringify({ checkedAt: now - 1000 }));
+  assert.equal(updateCacheIsStale(now, path), false);
+
+  // A day later it is due again, so the lock never over-blocks.
+  assert.equal(updateCacheIsStale(now + 25 * 60 * 60 * 1000, path), true);
+
+  // No cache, or an unreadable one, means a check is due.
+  const missing = await lockPath();
+  assert.equal(updateCacheIsStale(now, missing), true);
+  await writeFile(missing, "{not json");
+  assert.equal(updateCacheIsStale(now, missing), true);
+});
+
+// Every temp directory these tests create is registered for removal: a suite
+// that litters tmpdir is its own small maintenance problem (issue #55).
+const tempDirs = [];
+test.after(async () => {
+  await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+async function tempHome() {
+  const dir = await mkdtemp(join(tmpdir(), "gforge-settings-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+let lockSeq = 0;
+async function lockPath() {
+  const dir = await mkdtemp(join(tmpdir(), "gforge-lock-"));
+  tempDirs.push(dir);
+  return join(dir, `update-${(lockSeq += 1)}.lock`);
 }

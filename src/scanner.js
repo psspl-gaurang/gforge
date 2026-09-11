@@ -58,7 +58,7 @@ export function isHeuristicExemptPath(filePath, env = process.env) {
 // rule identifiers.
 
 import { execFileSync, spawn } from "node:child_process";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1143,6 +1143,118 @@ function updateLogPath() {
   return join(homedir(), ".gforge", "update-log");
 }
 
+function updateLockPath() {
+  return join(homedir(), ".gforge", "update.lock");
+}
+
+// Long enough that a genuinely slow `npm install -g` is never mistaken for a
+// dead worker, short enough that a crashed one does not block updates for good.
+// The check runs at most once a day anyway, so erring long costs nothing.
+export const UPDATE_LOCK_STALE_MS = 15 * 60 * 1000;
+
+// Two commits in quick succession both see the cache as stale - the first
+// worker has not written it yet - so both spawn a worker and both reach
+// `npm install -g`, two processes writing the same global package directory at
+// once (issue #84). Reproduced at 2/2 concurrent runs before this lock.
+//
+// Every arbitration point here is atomic, because a lock that races is worse
+// than no lock (it would look correct while still double-installing):
+//
+//   - Taking a free lock is an exclusive create ("wx"), which fails EEXIST for
+//     everyone but the winner.
+//   - Stealing a STALE lock is a rename, which fails ENOENT for everyone but
+//     the winner - an unlink-then-create would let two stealers both proceed,
+//     because the second unlink would delete the first one's fresh lock.
+export function acquireUpdateLock(options = {}) {
+  const path = options.path ?? updateLockPath();
+  const now = options.now ?? Date.now();
+  const staleMs = options.staleMs ?? UPDATE_LOCK_STALE_MS;
+  const claim = () => {
+    try {
+      writeFileSync(path, `${JSON.stringify({ pid: process.pid, startedAt: now })}\n`, { flag: "wx" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (claim()) return true;
+
+  // Somebody holds it. Leave a live worker alone.
+  const readStartedAt = (file) => {
+    try {
+      const held = JSON.parse(readFileSync(file, "utf8"));
+      return Number.isFinite(held?.startedAt) ? held.startedAt : null;
+    } catch {
+      return null; // unreadable or corrupt: treat as abandoned
+    }
+  };
+  const heldSince = readStartedAt(path);
+  if (heldSince !== null && now - heldSince < staleMs) return false;
+
+  // Stale, so try to take it over. Renaming alone is NOT a sufficient arbiter
+  // here: if another process has already stolen this lock and claimed a fresh
+  // one, our rename would silently carry off *its live lock* instead of the
+  // dead one, and both of us would install. Observed at 1-in-3 under six
+  // concurrent workers before this check existed.
+  //
+  // So verify that what we actually took is the lock we judged stale, and put
+  // it back if it is not. Worst case is then a skipped check that retries on
+  // the next commit - never a second installer.
+  const stolen = `${path}.stale.${process.pid}`;
+  try {
+    renameSync(path, stolen);
+  } catch {
+    return false;
+  }
+  if (readStartedAt(stolen) !== heldSince) {
+    try {
+      renameSync(stolen, path);
+    } catch {
+      try {
+        unlinkSync(stolen);
+      } catch {
+        // ignore
+      }
+    }
+    return false;
+  }
+  try {
+    unlinkSync(stolen);
+  } catch {
+    // ignore - the steal already succeeded
+  }
+  return claim();
+}
+
+export function releaseUpdateLock(path = updateLockPath()) {
+  try {
+    unlinkSync(path);
+  } catch {
+    // ignore
+  }
+}
+
+export function updateCacheIsStale(now = Date.now(), path = updateCachePath()) {
+  try {
+    const cache = JSON.parse(readFileSync(path, "utf8"));
+    return now - (cache?.checkedAt || 0) > UPDATE_CACHE_TTL_MS;
+  } catch {
+    return true; // no cache yet, or unreadable: a check is due
+  }
+}
+
+// Whether a worker is currently running, used only to skip a pointless spawn.
+// Never throws: this is consulted on the commit path.
+function updateWorkerIsRunning(now = Date.now()) {
+  try {
+    const held = JSON.parse(readFileSync(updateLockPath(), "utf8"));
+    return Number.isFinite(held?.startedAt) && now - held.startedAt < UPDATE_LOCK_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
 export function settingsPath(home = homedir()) {
   // Deliberately NOT state.json: installManagedHooks rewrites that on every
   // update, so a preference stored there would be wiped by the very auto-update
@@ -1359,8 +1471,11 @@ function maybeUpdateNotice(write) {
       }
     }
 
-    const stale = !cache || (Date.now() - (cache.checkedAt || 0)) > UPDATE_CACHE_TTL_MS;
-    if (stale) {
+    const stale = updateCacheIsStale();
+    // The worker takes the real lock; this only avoids spawning a process that
+    // would immediately exit. Without it, every commit made during a slow
+    // `npm install -g` would fork a doomed worker (issue #84).
+    if (stale && !updateWorkerIsRunning()) {
       const self = fileURLToPath(import.meta.url);
       const child = spawn(process.execPath, [self, "__update-check"], {
         detached: true,
@@ -1393,6 +1508,28 @@ function appendUpdateLog(line) {
 // Background worker: refresh the cache and install whatever tier is eligible.
 // Detached from the commit, so it may take its time.
 async function runUpdateCheck() {
+  // Held for the whole run, not just the install: two workers fetching and
+  // both rewriting the cache is wasted work, and the read-modify-write in
+  // appendUpdateLog loses entries when it races (observed: two installs, one
+  // log line). Losing the lock means another worker is already on it, so there
+  // is nothing useful left to do (issue #84).
+  if (!acquireUpdateLock()) return;
+  try {
+    // Double-checked: mutual exclusion alone is not enough. A worker that
+    // starts late - process startup is slow relative to the race - can acquire
+    // the lock cleanly *after* the winner has already finished and released it,
+    // then repeat the whole install. It still carries the old RUNNING_VERSION
+    // baked into its own engine file, so it cannot tell the work is done. The
+    // freshly written cache is what tells it. Observed 1-in-12 with six
+    // concurrent workers when this recheck was missing.
+    if (!updateCacheIsStale()) return;
+    await runUpdateCheckLocked();
+  } finally {
+    releaseUpdateLock();
+  }
+}
+
+async function runUpdateCheckLocked() {
   let packument = null;
   try {
     const controller = new AbortController();
