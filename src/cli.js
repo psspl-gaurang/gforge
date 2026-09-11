@@ -3,6 +3,7 @@ import { detectEnvironment } from "./environment.js";
 import {
   formatInstallResult,
   installManagedHooks,
+  validateInstallPreflight,
   uninstallManagedHooks,
   updateManagedHooks,
   verifyManagedHooks
@@ -63,6 +64,24 @@ async function runInstallOrUpdate(command, args, options, streams) {
   const force = args.includes("--force") || args.includes("-f");
   const selfUpdateDisabled = Boolean(process.env.GFORGE_NO_SELF_UPDATE) || options.skipSelfUpdate;
 
+  // Validate the environment before touching the network. The self-upgrade
+  // check is a registry round-trip that can take seconds, and on a machine
+  // without git - or on an unsupported platform - the command was going to fail
+  // regardless, so paying for that round-trip first is pure latency before an
+  // error the environment already determined (issue #32).
+  //
+  // The detected environment is then reused by the install itself rather than
+  // being detected twice.
+  const environment = options.environment ?? (await (options.detectEnvironment ?? detectEnvironment)(options));
+  const preflight = validateInstallPreflight(environment);
+  if (preflight.length > 0) {
+    streams.stderr.write(
+      formatInstallResult({ ok: false, command, exitCode: 1, hooksDirectory: null, messages: preflight })
+    );
+    return { exitCode: 1 };
+  }
+  const options_ = { ...options, environment };
+
   if (!selfUpdateDisabled) {
     const latest = await (options.getLatestVersion ?? getLatestVersion)(options);
     // --force reinstalls the latest, but never installs a version older than the
@@ -102,7 +121,7 @@ async function runInstallOrUpdate(command, args, options, streams) {
   const operation = command === "install"
     ? (options.installManagedHooks ?? installManagedHooks)
     : (options.updateManagedHooks ?? updateManagedHooks);
-  return runMutation(command, operation, options, streams);
+  return runMutation(command, operation, options_, streams);
 }
 
 // Runs a state-mutating command, turning any unexpected failure (permission
