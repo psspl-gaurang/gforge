@@ -1127,7 +1127,50 @@ const UPDATE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 // map of publish timestamps that quarantine needs, and the `dist-tags` the LTS
 // rule needs. Measured at ~33KB vs ~1KB, fetched at most once a day off the
 // commit path, so the extra bytes buy both signals for free.
-const REGISTRY_URL = "https://registry.npmjs.org/gforge";
+const DEFAULT_REGISTRY = "https://registry.npmjs.org/";
+
+// Quarantine decides whether a version is old enough to trust, from metadata
+// read over HTTP. The install then runs through npm, which resolves whatever
+// registry npm itself is configured for - a corporate mirror, an .npmrc
+// override. Those can be different registries publishing the same name and
+// version, so the artifact installed need not be the one whose age was checked
+// (issue #79).
+//
+// Resolving npm's registry once and using it for BOTH ends closes that by
+// construction, and respects a deliberate mirror rather than overriding it.
+// Only http(s) is accepted: the value reaches a fetch() and an npm argument.
+export function normalizeRegistryUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+  return parsed.href.endsWith("/") ? parsed.href : `${parsed.href}/`;
+}
+
+export function packumentUrl(registry) {
+  return `${normalizeRegistryUrl(registry) ?? DEFAULT_REGISTRY}gforge`;
+}
+
+// npm's own configured registry, or the public default when npm cannot be
+// asked. Never throws: this runs in the detached background worker.
+function resolveNpmRegistry() {
+  try {
+    const out = execFileSync("npm", ["config", "get", "registry"], {
+      cwd: homedir(),
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 8000
+    });
+    return normalizeRegistryUrl(out.toString("utf8")) ?? DEFAULT_REGISTRY;
+  } catch {
+    return DEFAULT_REGISTRY;
+  }
+}
 
 export const QUARANTINE_MS = {
   patch: 48 * 60 * 60 * 1000,
@@ -1530,12 +1573,15 @@ async function runUpdateCheck() {
 }
 
 async function runUpdateCheckLocked() {
+  // Resolved once, then used for both the metadata fetch and the install, so
+  // the two can never disagree about where the package came from (issue #79).
+  const registry = resolveNpmRegistry();
   let packument = null;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
     try {
-      const response = await fetch(REGISTRY_URL, { signal: controller.signal });
+      const response = await fetch(packumentUrl(registry), { signal: controller.signal });
       if (response.ok) packument = await response.json();
     } finally {
       clearTimeout(timer);
@@ -1581,7 +1627,9 @@ async function runUpdateCheckLocked() {
   if (!parseVersion(target.version)) return;
 
   try {
-    const npm = spawn("npm", ["install", "-g", `gforge@${target.version}`], {
+    // Pinned to the same registry the quarantine metadata came from, so the
+    // artifact installed is the one whose age was actually verified (issue #79).
+    const npm = spawn("npm", ["install", "-g", `--registry=${registry}`, `gforge@${target.version}`], {
       stdio: "ignore",
       shell: process.platform === "win32"
     });
