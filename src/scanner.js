@@ -605,6 +605,27 @@ function looksBinary(content) {
 // ---------------------------------------------------------------------------
 const INLINE_ALLOW = /(?:gforge|gitleaks):allow/i;
 
+// Allowlist entries are repo-controlled and compiled into regexes that run
+// against every staged path on every commit. A pattern with nested unbounded
+// quantifiers backtracks catastrophically: `(a+)+$` against a 31-character
+// path did not finish in 12 seconds here, which hangs the commit hook outright
+// (issue #31).
+//
+// A clone of an untrusted repository inherits its .gforgeignore silently, so
+// the trust assumption is worth enforcing rather than documenting alone.
+const ALLOWLIST_MAX_PATTERN_LENGTH = 200;
+// A group that already contains an unbounded quantifier, itself quantified:
+// (a+)+ (a*)* (a+)* (a*)+ (a+){2,} and so on. Conservative on purpose - real
+// allowlist entries look like `test/fixtures/` or `^docs/sample\.md$`, and
+// none of those come close to this shape.
+const NESTED_QUANTIFIER_RE = /\([^)]*[+*][^)]*\)\s*(?:[+*]|\{\d+,\s*\})/;
+
+export function isRiskyAllowlistPattern(line) {
+  const value = String(line ?? "");
+  if (value.length > ALLOWLIST_MAX_PATTERN_LENGTH) return true;
+  return NESTED_QUANTIFIER_RE.test(value);
+}
+
 export function parseAllowlist(text) {
   if (!text) return [];
   return text
@@ -612,12 +633,18 @@ export function parseAllowlist(text) {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
     .map((line) => {
-      try {
-        return new RegExp(line);
-      } catch {
-        // Not a valid regex: treat as a literal path substring.
-        return { test: (value) => value.includes(line) };
+      // Falls through to the literal matcher below, which is the same
+      // treatment an uncompilable regex already got. The entry stops matching
+      // as a pattern, which fails SAFE: the path is scanned rather than
+      // skipped, so a hostile or broken entry can never hide a file.
+      if (!isRiskyAllowlistPattern(line)) {
+        try {
+          return new RegExp(line);
+        } catch {
+          // Not a valid regex: treat as a literal path substring.
+        }
       }
+      return { test: (value) => value.includes(line) };
     });
 }
 

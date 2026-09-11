@@ -189,6 +189,17 @@ Maximum coverage occasionally flags something safe. Three escape hatches:
 
 - **One-off:** bypass a single commit with `git commit --no-verify`.
 
+Each non-comment line is treated as a regular expression, falling back to a
+plain substring match when it is not valid regex syntax.
+
+Because these files live in the repository, cloning an untrusted repo means
+inheriting its allowlist. Two limits apply so that a hostile or simply careless
+entry cannot stall your commits: patterns are capped at 200 characters, and
+patterns with nested unbounded quantifiers (`(a+)+`, `(a*)*`) are refused —
+those backtrack catastrophically and would otherwise hang the hook. A refused
+pattern falls back to substring matching, so it loses its allowlisting power
+rather than silently hiding files.
+
 ## Staying up to date
 
 `gforge update` upgrades the package to the latest published release and refreshes
