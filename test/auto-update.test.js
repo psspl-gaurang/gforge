@@ -9,6 +9,8 @@ import {
   UPDATE_LOCK_STALE_MS,
   acquireUpdateLock,
   classifyVersionBump,
+  normalizeRegistryUrl,
+  packumentUrl,
   describeMajorNotice,
   describeUpdateOutcome,
   parseEngineVersion,
@@ -435,6 +437,37 @@ async function lockPath() {
   tempDirs.push(dir);
   return join(dir, `update-${(lockSeq += 1)}.lock`);
 }
+
+// ---------------------------------------------------------------------------
+// issue #79: the quarantine check and the install must agree on the registry
+// ---------------------------------------------------------------------------
+
+test("issue #79: only http(s) registries are accepted", () => {
+  // The value reaches both a fetch() and an npm argument, so anything that is
+  // not a plain http(s) URL is refused rather than passed along.
+  assert.equal(normalizeRegistryUrl("https://registry.npmjs.org/"), "https://registry.npmjs.org/");
+  assert.equal(normalizeRegistryUrl("http://mirror.corp:4873/"), "http://mirror.corp:4873/");
+  // Trailing slash is normalised, so the packument path cannot end up doubled
+  // or missing a separator.
+  assert.equal(normalizeRegistryUrl("https://registry.npmjs.org"), "https://registry.npmjs.org/");
+  assert.equal(normalizeRegistryUrl("  https://a.example/  "), "https://a.example/");
+
+  for (const bad of ["file:///etc/passwd", "javascript:alert(1)", "not a url", "", "   ", null, undefined]) {
+    assert.equal(normalizeRegistryUrl(bad), null, JSON.stringify(bad));
+  }
+});
+
+test("issue #79: the packument is fetched from the configured registry, not a hardcoded one", () => {
+  // The mismatch this closes: metadata read from the public registry while the
+  // install resolved a corporate mirror, so the artifact installed was never
+  // the one whose age quarantine had approved.
+  assert.equal(packumentUrl("http://mirror.corp:4873/"), "http://mirror.corp:4873/gforge");
+  assert.equal(packumentUrl("https://registry.npmjs.org"), "https://registry.npmjs.org/gforge");
+  // An unusable or absent value falls back to the public registry rather than
+  // producing a malformed URL.
+  assert.equal(packumentUrl(null), "https://registry.npmjs.org/gforge");
+  assert.equal(packumentUrl("file:///etc/passwd"), "https://registry.npmjs.org/gforge");
+});
 
 // ---------------------------------------------------------------------------
 // issue #83: a zero exit from npm is not proof the update took effect
