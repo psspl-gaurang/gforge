@@ -214,8 +214,12 @@ gforge: v1.2.0 is available (you have v1.1.0). Run: gforge update
 
 ## Configuration
 
-Behavior is controlled entirely through environment variables — there is no config
-file to manage.
+Behavior is controlled through the environment variables below.
+
+GForge keeps its own state under `~/.gforge` — the managed hooks, an install
+state file, and an update-check cache. Those are managed for you by
+`install` / `update` / `uninstall` and are not meant to be edited by hand, so
+there is nothing to set up before the table below applies.
 
 | Variable | Effect |
 | --- | --- |
