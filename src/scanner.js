@@ -176,8 +176,16 @@ function isAsciiLowerOrDigit(ch) {
 // (snake_case, ALL_CAPS, plain) — issue #27. Returns the captured value, or
 // null. Loops past a candidate whose boundary or tail doesn't hold, rather
 // than giving up after the first (leftmost) keyword-shaped substring.
-function matchGenericKeyword(line) {
+// Returns EVERY assigned value on the line, not just the first. Each tail runs
+// to end of line, so on `token: process.env.TOKEN, password: "S3cret!789"` the
+// first candidate's value is the whole remainder - which reads as an env-var
+// reference and is correctly cleared. Stopping there meant the hardcoded
+// password after it was never examined at all, and the same secret split onto
+// its own line was caught. One-line object literals are a common style, so this
+// was a broad gap rather than a corner case (issue #81).
+function matchGenericKeywordValues(line) {
   GENERIC_KEYWORD_CORE_RE.lastIndex = 0;
+  const values = [];
   let found;
   while ((found = GENERIC_KEYWORD_CORE_RE.exec(line))) {
     const start = found.index;
@@ -195,9 +203,9 @@ function matchGenericKeyword(line) {
     const afterKeyword = segment ? rest.slice(segment[0].length) : rest;
 
     const tail = afterKeyword.match(KEYWORD_TAIL_RE);
-    if (tail) return tail[1];
+    if (tail) values.push(tail[1]);
   }
-  return null;
+  return values;
 }
 // Placeholder shapes shared by the generic rule and the .env cross-reference.
 // These two lists had drifted: the dotenv layer knew `your_db_password` was a
@@ -692,17 +700,22 @@ export function scanText(filePath, content, options = {}) {
     }
 
     if (includeGeneric) {
-      const value = matchGenericKeyword(line);
-      // Everything left of the value: the capture runs to end of line, so the
-      // remainder names the key the value was assigned to.
-      const keyContext = value !== null ? line.slice(0, line.length - value.length) : "";
-      if (value !== null && looksLikeHardcodedSecret(value, { codeFile, keyContext })) {
-        findings.push({
-          file: filePath,
-          line: lineNumber,
-          ruleId: GENERIC_SECRET_RULE_ID,
-          description: GENERIC_SECRET_DESCRIPTION
-        });
+      // Still at most one finding per line - the report is per line, and a
+      // second one would just be noise - but every candidate on the line is
+      // now examined before concluding there is nothing there (issue #81).
+      for (const value of matchGenericKeywordValues(line)) {
+        // Everything left of the value: the capture runs to end of line, so the
+        // remainder names the key the value was assigned to.
+        const keyContext = line.slice(0, line.length - value.length);
+        if (looksLikeHardcodedSecret(value, { codeFile, keyContext })) {
+          findings.push({
+            file: filePath,
+            line: lineNumber,
+            ruleId: GENERIC_SECRET_RULE_ID,
+            description: GENERIC_SECRET_DESCRIPTION
+          });
+          break;
+        }
       }
     }
 
