@@ -17,6 +17,13 @@ export const PACKAGE_NAME = "gforge";
 // avoid the shell. Version strings are validated before interpolation so there
 // is no shell-injection surface.
 const NPM_VIA_SHELL = process.platform === "win32";
+// Every npm call runs from the user's home directory, never from wherever the
+// caller happened to be. With shell:true on Windows, cmd.exe resolves an
+// unqualified command against the CURRENT DIRECTORY before PATH - so a
+// repository containing its own npm.cmd (untracked is enough) would have that
+// file run instead of the real npm, during a command the developer thinks is
+// just an upgrade (issue #78).
+const NPM_CWD = homedir();
 const SEMVER = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
 // Numeric compare of X.Y.Z (prerelease/build metadata ignored).
@@ -56,6 +63,7 @@ export async function getLatestVersion(options = {}) {
   const exec = options.execFile ?? execFileAsync;
   try {
     const { stdout } = await exec("npm", ["view", PACKAGE_NAME, "version"], {
+      cwd: NPM_CWD,
       timeout: options.timeoutMs ?? 8000,
       shell: NPM_VIA_SHELL
     });
@@ -70,6 +78,7 @@ async function getGlobalBinPath(options = {}) {
   const exec = options.execFile ?? execFileAsync;
   try {
     const { stdout } = await exec("npm", ["root", "-g"], {
+      cwd: NPM_CWD,
       timeout: options.timeoutMs ?? 8000,
       shell: NPM_VIA_SHELL
     });
@@ -99,6 +108,7 @@ export async function performSelfUpgrade(command, version, options = {}) {
   // indefinitely.
   const installTimeoutMs = options.installTimeoutMs ?? 60000;
   const install = run("npm", ["install", "-g", `${PACKAGE_NAME}@latest`], {
+    cwd: NPM_CWD,
     stdio: "inherit",
     shell: NPM_VIA_SHELL,
     timeout: installTimeoutMs

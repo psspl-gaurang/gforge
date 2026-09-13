@@ -1217,6 +1217,13 @@ async function runUpdateCheck() {
       // Install target is the constant gforge@latest (== the version we just
       // detected); nothing registry-derived is interpolated into the command.
       const npm = spawn("npm", ["install", "-g", "gforge@latest"], {
+        // Run from the user's home directory, never the repository being
+        // committed to. With shell:true on Windows, cmd.exe resolves an
+        // unqualified command against the CURRENT DIRECTORY before PATH, so a
+        // repo carrying its own npm.cmd - untracked is enough - would have that
+        // file executed by an unattended background process that an ordinary
+        // commit triggered (issue #78).
+        cwd: homedir(),
         stdio: "ignore",
         shell: process.platform === "win32"
       });
