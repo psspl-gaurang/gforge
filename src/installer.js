@@ -293,7 +293,10 @@ export async function verifyManagedHooks(options = {}) {
   checks.push(await checkScannerContent(scannerPath));
 
   const preCommitPath = resolvePreCommitPath(environment.home.path);
-  checks.push(await checkPreCommitShim(preCommitPath));
+  // The node path the installer baked into the shim, so the check can compare
+  // against exactly what was written rather than guessing (issue #82).
+  const { state } = await readStateFile(resolveStatePath(environment.home.path));
+  checks.push(await checkPreCommitShim(preCommitPath, state?.nodePath ?? null));
   checks.push(await checkHookExecutable(PRE_COMMIT_FILE_NAME, preCommitPath, environment.platform.name));
 
   return {
@@ -329,22 +332,58 @@ async function checkScannerContent(scannerPath) {
 // The pre-commit shim embeds a machine-specific Node path, so verify checks its
 // structure (present and delegating to the managed scanner) rather than an
 // exact byte match.
-async function checkPreCommitShim(preCommitPath) {
+// Does this hook actually RUN the scanner, as opposed to merely mentioning it?
+// The old check was `includes(SCANNER_FILE_NAME) && includes("exec")`, which a
+// two-line no-op satisfies:
+//
+//     #!/bin/sh
+//     # exec gforge-scan.mjs
+//     exit 0
+//
+// That reported PASS while nothing was scanned (issue #82). Comment lines are
+// stripped before looking, and the exec has to be a real statement invoking the
+// resolved scanner path.
+export function hookInvokesScanner(content) {
+  const statements = String(content ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/#.*$/, "").trim())
+    .filter(Boolean);
+
+  const resolvesScanner = statements.some(
+    (line) => /\bSCANNER=/.test(line) && line.includes(SCANNER_FILE_NAME)
+  );
+  const execsScanner = statements.some((line) => /\bexec\b/.test(line) && /\$(?:SCANNER|\{SCANNER\})/.test(line));
+  return resolvesScanner && execsScanner;
+}
+
+async function checkPreCommitShim(preCommitPath, nodePath) {
+  const label = `${PRE_COMMIT_FILE_NAME}-content`;
+  let content;
   try {
-    const content = await readFile(preCommitPath, "utf8");
-    const wired = content.includes(SCANNER_FILE_NAME) && content.includes("exec");
-    return {
-      status: wired ? "PASS" : "FAIL",
-      label: `${PRE_COMMIT_FILE_NAME}-content`,
-      detail: wired ? "delegates to managed scanner" : "does not delegate to managed scanner"
-    };
+    content = await readFile(preCommitPath, "utf8");
   } catch {
-    return {
-      status: "FAIL",
-      label: `${PRE_COMMIT_FILE_NAME}-content`,
-      detail: `${preCommitPath} not found`
-    };
+    return { status: "FAIL", label, detail: `${preCommitPath} not found` };
   }
+
+  // Preferred: the same byte-for-byte comparison the scanner engine already
+  // gets. The node path is the only machine-specific part, and the installer
+  // records the one it baked in, so this stays exact even after the user's node
+  // moves (the shim tries PATH first, so a stale baked path still works).
+  if (nodePath) {
+    const expected = getManagedFiles(nodePath).find((file) => file.name === PRE_COMMIT_FILE_NAME)?.content;
+    if (expected !== undefined) {
+      return content === expected
+        ? { status: "PASS", label, detail: "matches the managed hook" }
+        : { status: "FAIL", label, detail: "hook has been modified or is stale - run `gforge update`" };
+    }
+  }
+
+  // Fallback for an install whose state file predates the recorded node path,
+  // or is unreadable: structural rather than exact, but still requires a real
+  // invocation rather than the substrings appearing anywhere.
+  return hookInvokesScanner(content)
+    ? { status: "PASS", label, detail: "delegates to managed scanner" }
+    : { status: "FAIL", label, detail: "does not delegate to managed scanner" };
 }
 
 export function formatInstallResult(result) {
