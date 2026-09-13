@@ -1138,7 +1138,17 @@ const DEFAULT_REGISTRY = "https://registry.npmjs.org/";
 //
 // Resolving npm's registry once and using it for BOTH ends closes that by
 // construction, and respects a deliberate mirror rather than overriding it.
-// Only http(s) is accepted: the value reaches a fetch() and an npm argument.
+// Only http(s) is accepted, because the value reaches a fetch().
+
+// Scheme is not the whole check. The URL parser leaves shell syntax untouched:
+// `https://registry.npmjs.org/&ver&` comes back from `npm config get registry`
+// unchanged, parses as an ordinary https URL, and `&` is a command separator.
+// The registry no longer reaches npm's argv at all - it is passed through the
+// environment instead - so this is the second lock rather than the first, but
+// the protocol test was never the guarantee it read as. A registry URL has no
+// legitimate use for any of these characters.
+const SHELL_METACHARACTERS_RE = /[\s&|;<>()$`\\"'!^%]/;
+
 export function normalizeRegistryUrl(value) {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
@@ -1149,7 +1159,9 @@ export function normalizeRegistryUrl(value) {
     return null;
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
-  return parsed.href.endsWith("/") ? parsed.href : `${parsed.href}/`;
+  const href = parsed.href.endsWith("/") ? parsed.href : `${parsed.href}/`;
+  if (SHELL_METACHARACTERS_RE.test(href)) return null;
+  return href;
 }
 
 export function packumentUrl(registry) {
@@ -1401,8 +1413,14 @@ export function resolveAutoUpdateSettings({ fileContent = null, env = {} } = {})
 }
 
 // How long a published version has been public, clamped at zero so a machine
-// with a clock set behind the registry cannot report a negative age and a clock
-// set forward cannot be used to fast-forward past a quarantine window.
+// with a clock set behind the registry reports no age rather than a negative
+// one.
+//
+// The clamp is not a defence against a clock set *forward*: it can only raise a
+// value, so a machine 30 days fast sees a version published an hour ago as 30
+// days old and clears every window, including the major one at 31. That is
+// accepted rather than fixed - anyone who can set the system clock can also
+// edit ~/.gforge/settings.json - but it is not a guarantee this offers.
 export function versionAgeMs(publishedAt, now) {
   const published = Date.parse(String(publishedAt ?? ""));
   if (!Number.isFinite(published)) return null;
@@ -1675,10 +1693,20 @@ async function runUpdateCheckLocked() {
 
   try {
     // Pinned to the same registry the quarantine metadata came from, so the
-    // artifact installed is the one whose age was actually verified (issue #79).
-    const npm = spawn("npm", ["install", "-g", `--registry=${registry}`, `gforge@${target.version}`], {
+    // artifact installed is the one whose age was actually verified (issue #79)
+    // - but through the environment rather than a --registry= flag. On Windows
+    // npm is npm.cmd and can only be spawned through a shell, and `shell: true`
+    // concatenates argv into a command string without escaping it (Node warns
+    // about exactly this as DEP0190), so a registry value carrying `&` would
+    // run as its own command. npm reads npm_config_* from the environment with
+    // higher precedence than any .npmrc, so the pin still holds and nothing
+    // registry-derived is left for a shell to parse. Everything remaining in
+    // argv is either a literal or a version parseVersion() has just confirmed
+    // is three plain integers.
+    const npm = spawn("npm", ["install", "-g", `gforge@${target.version}`], {
       stdio: "ignore",
-      shell: process.platform === "win32"
+      shell: process.platform === "win32",
+      env: { ...process.env, npm_config_registry: registry }
     });
     const code = await new Promise((resolve) => npm.on("close", resolve).on("error", () => resolve(-1)));
     const stamp = new Date().toISOString();

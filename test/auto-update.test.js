@@ -443,8 +443,9 @@ async function lockPath() {
 // ---------------------------------------------------------------------------
 
 test("issue #79: only http(s) registries are accepted", () => {
-  // The value reaches both a fetch() and an npm argument, so anything that is
-  // not a plain http(s) URL is refused rather than passed along.
+  // The value reaches a fetch(), so a non-http(s) scheme is refused rather than
+  // passed along. Scheme is only half of it - the content is pinned separately
+  // below, because a plain https: URL can still carry a command separator.
   assert.equal(normalizeRegistryUrl("https://registry.npmjs.org/"), "https://registry.npmjs.org/");
   assert.equal(normalizeRegistryUrl("http://mirror.corp:4873/"), "http://mirror.corp:4873/");
   // Trailing slash is normalised, so the packument path cannot end up doubled
@@ -454,6 +455,51 @@ test("issue #79: only http(s) registries are accepted", () => {
 
   for (const bad of ["file:///etc/passwd", "javascript:alert(1)", "not a url", "", "   ", null, undefined]) {
     assert.equal(normalizeRegistryUrl(bad), null, JSON.stringify(bad));
+  }
+});
+
+test("PR #77 review: an accepted registry cannot carry shell metacharacters", () => {
+  // On Windows npm is npm.cmd and can only be spawned through a shell, and
+  // `shell: true` concatenates argv without escaping it. The scheme check let
+  // this through: `npm config get registry` returns the value from .npmrc
+  // verbatim, the URL parser does not encode `&`, `|`, `;`, `$` or `(`, and `&`
+  // separates commands - so `https://registry.npmjs.org/&ver&` reached the
+  // spawn and ran `ver` as its own process.
+  //
+  // The structural fix is that the registry is passed through npm_config_registry
+  // instead of a --registry= argument, so it never reaches argv. This pins the
+  // second lock: a value that survives normalisation is safe to concatenate.
+  assert.equal(normalizeRegistryUrl("https://registry.npmjs.org/&ver&"), null);
+
+  for (const bad of [
+    "https://evil.com/a&calc",
+    "https://evil.com/a|whoami",
+    "https://evil.com/a;id",
+    "https://evil.com/a$(id)",
+    "https://evil.com/a`id`",     // percent-encoded by the parser, still refused
+    "https://evil.com/a>out",
+    "https://evil.com/a<in",
+    "https://evil.com/%USERPROFILE%",
+    "https://evil.com/a^b",
+    "https://evil.com/a!b",
+    'https://evil.com/a"b',
+    "https://evil.com/a'b"
+  ]) {
+    assert.equal(normalizeRegistryUrl(bad), null, JSON.stringify(bad));
+  }
+
+  // The invariant the spawn depends on, stated as a property rather than a
+  // list: nothing that survives normalisation carries shell syntax.
+  const unsafe = /[\s&|;<>()$`\\"'!^%]/;
+  for (const value of [
+    "https://registry.npmjs.org/",
+    "http://mirror.corp:4873/",
+    "https://npm.pkg.github.com/",
+    "https://artifactory.corp/api/npm/npm-virtual/"
+  ]) {
+    const normalised = normalizeRegistryUrl(value);
+    assert.ok(normalised, `${value} is a legitimate registry and must still be accepted`);
+    assert.equal(unsafe.test(normalised), false, normalised);
   }
 });
 
