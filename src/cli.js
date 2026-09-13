@@ -15,6 +15,7 @@ import {
   readCachedUpdateNotice
 } from "./npm-update.js";
 import { describeDotenvSources } from "./scanner.js";
+import { runSettingsCommand } from "./settings.js";
 import { createVerificationReport, formatVerificationReport } from "./verify.js";
 
 export async function runCli(args, streams, options = {}) {
@@ -36,6 +37,10 @@ export async function runCli(args, streams, options = {}) {
 
   if (command === "uninstall") {
     return runMutation("uninstall", options.uninstallManagedHooks ?? uninstallManagedHooks, options, streams);
+  }
+
+  if (command === "settings") {
+    return (options.runSettingsCommand ?? runSettingsCommand)(args, streams, options);
   }
 
   if (command === "verify") {
@@ -200,11 +205,12 @@ function helpText(stream) {
     row("verify", "Verify the environment and installed hooks (read-only)"),
     row("update", "Upgrade to the latest version (if any) and refresh the hooks"),
     row("uninstall", "Remove GForge-owned hooks and restore your Git config"),
+    row("settings", "Show settings; --no-autoupdate / --autoupdate (minor+major)"),
     row("version", "Display the version"),
     row("help", "Display this help"),
     "",
     header("Environment:"),
-    row("GFORGE_AUTO_UPDATE=0", "Disable automatic background upgrades (on by default)", 30),
+    row("GFORGE_AUTO_UPDATE=0", "Disable minor/major auto-update (overrides settings)", 30),
     row("GFORGE_NO_SELF_UPDATE=1", "Skip the npm self-upgrade in install / update", 30),
     row("GFORGE_SKIP_POSTINSTALL=1", "Skip auto-setup during npm install", 30),
     row("GFORGE_NO_DEFAULT_EXCLUDES=1", "Scan translations, docs and build output too", 30),

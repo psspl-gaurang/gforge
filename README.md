@@ -203,14 +203,59 @@ rather than silently hiding files.
 ## Staying up to date
 
 `gforge update` upgrades the package to the latest published release and refreshes
-the hook — no manual `npm install` needed. GForge also keeps itself current on its
-own: at most once a day it checks for a new version in a detached background
-process (it never delays or blocks a commit), installs it, and prints a one-line
-notice on commit:
+the hook — no manual `npm install` needed.
+
+GForge also keeps itself current on its own. At most once a day it checks the
+registry in a detached background process (it never delays or blocks a commit)
+and installs what is eligible. Auto-update is **on by default**, because a stale
+scanner is its own security problem — detection rules improve continuously, and a
+workstation pinned several versions back is quietly less protected.
+
+To bound the risk that comes with an unattended update channel, each release tier
+has to sit on the registry for a **quarantine window** before it will install:
+
+| Tier | Quarantine | Auto-installs | Can be disabled |
+| --- | --- | --- | --- |
+| patch | 48 hours | yes | **no** |
+| minor | 7 days | yes | yes |
+| major | 30 days, and only when tagged `lts` | yes | yes |
+
+The window exists because a compromised publishing credential would ship a
+*patch* — that is the fastest-moving tier — so the delay is what gives a bad
+release time to be noticed and pulled. Patch updates are deliberately not
+disableable: that is where security and critical fixes to GForge itself ship.
+
+Majors never install silently. A new major always prints a notice, and only
+auto-installs if it is tagged `lts` and has been published 30 days:
 
 ```
-gforge: v1.2.0 is available (you have v1.1.0). Run: gforge update
+!! gforge v2.0.0 is a new LTS major (you have v1.5.2). It installs automatically
+   once it has been published 30 days; run `gforge update` to take it now.
+
+gforge v2.1.0 is a new major (you have v1.5.2). It is not marked LTS, so it will
+not install automatically. Run `gforge update` to take it.
 ```
+
+Every unattended install is recorded in `~/.gforge/update-log` and announced on
+the next commit (`gforge: auto-updated v1.5.2 -> v1.5.3`), so an update is never
+something that just silently happened to your machine.
+
+### Turning auto-update off
+
+```bash
+gforge settings                     # show the current state
+gforge settings --no-autoupdate     # stop auto-installing minor and major releases
+gforge settings --autoupdate        # re-enable
+```
+
+This is stored in `~/.gforge/settings.json` and survives updates. Prefer it over
+the `GFORGE_AUTO_UPDATE` environment variable: the hook runs as
+`git → sh → node`, which does not inherit your shell profile when you commit from
+a GUI client, so an env var set in `.zshrc` can silently fail to apply.
+
+Patch updates continue after `--no-autoupdate`. If you need to stop those too,
+uninstall (`gforge uninstall`) — a security tool that can silently skip its own
+security fixes is not a state worth supporting.
 
 ## Configuration
 
@@ -223,7 +268,7 @@ there is nothing to set up before the table below applies.
 
 | Variable | Effect |
 | --- | --- |
-| `GFORGE_AUTO_UPDATE=0` | Notify only; do not auto-install new versions (default: auto-install on). |
+| `GFORGE_AUTO_UPDATE=0` | Disable minor/major auto-install (default: on). Overrides `gforge settings`, and treats any value that is not `1`/`true`/`on`/`yes` as off. Patch updates still install — see [Staying up to date](#staying-up-to-date). |
 | `GFORGE_NO_SELF_UPDATE=1` | Skip the npm self-upgrade in `install`/`update` (CI / air-gapped). |
 | `GFORGE_SKIP_POSTINSTALL=1` | Skip automatic hook setup during `npm install`. |
 | `GFORGE_NODE=/path/to/node` | Pin the Node.js runtime the hook uses. |
