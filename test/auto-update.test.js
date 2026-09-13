@@ -12,6 +12,8 @@ import {
   normalizeRegistryUrl,
   packumentUrl,
   describeMajorNotice,
+  describeUpdateOutcome,
+  parseEngineVersion,
   parseVersion,
   releaseUpdateLock,
   resolveAutoUpdateSettings,
@@ -465,4 +467,51 @@ test("issue #79: the packument is fetched from the configured registry, not a ha
   // producing a malformed URL.
   assert.equal(packumentUrl(null), "https://registry.npmjs.org/gforge");
   assert.equal(packumentUrl("file:///etc/passwd"), "https://registry.npmjs.org/gforge");
+});
+
+// ---------------------------------------------------------------------------
+// issue #83: a zero exit from npm is not proof the update took effect
+// ---------------------------------------------------------------------------
+
+test("issue #83: an install only counts when the engine on disk is the new version", () => {
+  // `npm install -g` can exit 0 and never run the package's postinstall -
+  // ignore-scripts in .npmrc or npm_config_ignore_scripts, or a postinstall
+  // that fails without npm propagating it. Refreshing ~/.gforge/hooks is
+  // exactly what that step does, so the engine the next commit runs would stay
+  // on the old version while the log and cache both claimed success.
+  assert.deepEqual(describeUpdateOutcome({ code: 0, onDisk: "0.3.5", version: "0.3.5" }), {
+    refreshed: true,
+    outcome: "installed"
+  });
+
+  // Package installed, hooks untouched: the reported failure mode.
+  assert.deepEqual(describeUpdateOutcome({ code: 0, onDisk: "0.3.0", version: "0.3.5" }), {
+    refreshed: false,
+    outcome: "installed-but-hooks-stale(onDisk=0.3.0)"
+  });
+
+  // Engine unreadable - cannot prove it refreshed, so do not claim it did.
+  assert.deepEqual(describeUpdateOutcome({ code: 0, onDisk: null, version: "0.3.5" }), {
+    refreshed: false,
+    outcome: "installed-but-hooks-stale(onDisk=unknown)"
+  });
+
+  // A genuine npm failure keeps reporting as a failure, not as staleness.
+  assert.equal(describeUpdateOutcome({ code: 1, onDisk: null, version: "0.3.5" }).outcome, "failed(exit=1)");
+  assert.equal(describeUpdateOutcome({ code: -1, onDisk: null, version: "0.3.5" }).outcome, "failed(exit=-1)");
+});
+
+test("issue #83: the engine's baked version is read from the installed file", () => {
+  // getScannerContent() substitutes the placeholder at install time, so an
+  // installed copy carries a literal version.
+  assert.equal(parseEngineVersion('const RUNNING_VERSION = "0.3.9";'), "0.3.9");
+  assert.equal(parseEngineVersion('// header\nconst RUNNING_VERSION = "1.0.0";\nmore()'), "1.0.0");
+
+  // An un-substituted placeholder means a source checkout, not an install, and
+  // must not be mistaken for a real version.
+  assert.equal(parseEngineVersion('const RUNNING_VERSION = "__GFORGE_VERSION__";'), null);
+
+  for (const bad of ["", null, undefined, "nothing here", "const RUNNING_VERSION = 0.3.9;"]) {
+    assert.equal(parseEngineVersion(bad), null, JSON.stringify(bad));
+  }
 });
