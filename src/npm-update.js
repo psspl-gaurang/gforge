@@ -22,8 +22,19 @@ const NPM_VIA_SHELL = process.platform === "win32";
 // unqualified command against the CURRENT DIRECTORY before PATH - so a
 // repository containing its own npm.cmd (untracked is enough) would have that
 // file run instead of the real npm, during a command the developer thinks is
-// just an upgrade (issue #78).
-const NPM_CWD = homedir();
+// just an upgrade.
+//
+// This narrows the trust boundary rather than removing it: an npm.cmd sitting
+// in the home directory is still picked up, so the guarantee is "not whichever
+// repository you happen to be committing in", not "the real npm". Resolving npm
+// to an absolute path once would end the question, at the cost of having to
+// track npm.cmd, the npm-cli.js shim and version-manager shims.
+//
+// Read per call rather than cached at module load, so this agrees with the
+// background worker in scanner.js, which reads it at spawn time (issue #78).
+function npmCwd() {
+  return homedir();
+}
 const SEMVER = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
 // Numeric compare of X.Y.Z (prerelease/build metadata ignored).
@@ -63,7 +74,7 @@ export async function getLatestVersion(options = {}) {
   const exec = options.execFile ?? execFileAsync;
   try {
     const { stdout } = await exec("npm", ["view", PACKAGE_NAME, "version"], {
-      cwd: NPM_CWD,
+      cwd: npmCwd(),
       timeout: options.timeoutMs ?? 8000,
       shell: NPM_VIA_SHELL
     });
@@ -78,7 +89,7 @@ async function getGlobalBinPath(options = {}) {
   const exec = options.execFile ?? execFileAsync;
   try {
     const { stdout } = await exec("npm", ["root", "-g"], {
-      cwd: NPM_CWD,
+      cwd: npmCwd(),
       timeout: options.timeoutMs ?? 8000,
       shell: NPM_VIA_SHELL
     });
@@ -108,13 +119,22 @@ export async function performSelfUpgrade(command, version, options = {}) {
   // indefinitely.
   const installTimeoutMs = options.installTimeoutMs ?? 60000;
   const install = run("npm", ["install", "-g", `${PACKAGE_NAME}@latest`], {
-    cwd: NPM_CWD,
+    cwd: npmCwd(),
     stdio: "inherit",
     shell: NPM_VIA_SHELL,
     timeout: installTimeoutMs
   });
   if (install?.error?.code === "ETIMEDOUT") {
     return { ok: false, error: `npm install -g ${PACKAGE_NAME}@latest timed out after ${installTimeoutMs}ms` };
+  }
+  // spawnSync reports a failure to START the child in `error`, leaving status
+  // null - so without this the caller is told "exited with status null", which
+  // explains nothing. Now that every npm call carries a cwd, the likeliest
+  // cause is that directory: a home that does not exist or cannot be entered
+  // stops the install before npm runs at all (issue #78).
+  if (install?.error) {
+    const reason = install.error.code ?? install.error.message;
+    return { ok: false, error: `npm install -g ${PACKAGE_NAME}@latest could not start (${reason}) in ${npmCwd()}` };
   }
   if (!install || install.status !== 0) {
     return { ok: false, error: `npm install -g ${PACKAGE_NAME}@latest exited with status ${install ? install.status : "unknown"}` };

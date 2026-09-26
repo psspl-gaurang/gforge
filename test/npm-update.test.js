@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 import { compareVersions, getLatestVersion, isNewer, performSelfUpgrade } from "../src/npm-update.js";
 
@@ -68,7 +70,7 @@ test("performSelfUpgrade refuses a version that is not plain semver (no command 
   assert.equal(spawned, false);
 });
 
-test("issue #78: every npm call runs from the home directory, not the caller's cwd", async () => {
+test("issue #78: the npm calls in npm-update.js run from the home directory", async () => {
   // On Windows these run through cmd.exe (npm is npm.cmd), and cmd.exe resolves
   // an unqualified command against the CURRENT DIRECTORY before PATH. Inheriting
   // the repository's cwd therefore let a repo-provided npm.cmd - untracked is
@@ -76,10 +78,11 @@ test("issue #78: every npm call runs from the home directory, not the caller's c
   // the developer from inside the repo, so this is not a corner case.
   const home = homedir();
   const seen = [];
+  const record = (cmd, args, opts) => seen.push({ cmd, args: args.join(" "), cwd: opts?.cwd });
 
   await getLatestVersion({
     execFile: async (cmd, args, opts) => {
-      seen.push({ cmd, args: args.join(" "), cwd: opts?.cwd });
+      record(cmd, args, opts);
       return { stdout: "1.2.3\n" };
     }
   });
@@ -87,24 +90,84 @@ test("issue #78: every npm call runs from the home directory, not the caller's c
   await performSelfUpgrade("update", "1.2.3", {
     skipReexec: true,
     execFile: async (cmd, args, opts) => {
-      seen.push({ cmd, args: args.join(" "), cwd: opts?.cwd });
+      record(cmd, args, opts);
       return { stdout: "/usr/lib/node_modules\n" };
     },
     spawnSync: (cmd, args, opts) => {
-      seen.push({ cmd, args: args.join(" "), cwd: opts?.cwd });
+      record(cmd, args, opts);
       return { status: 0 };
     }
   });
 
-  // Only the npm invocations: the re-exec of the freshly installed binary is
-  // also a spawn, but it runs node against an absolute script path, so there is
-  // no unqualified name for cmd.exe to resolve against the current directory -
-  // and it should keep running where the developer invoked the command.
-  const npmCalls = seen.filter((call) => call.cmd === "npm");
-  assert.ok(npmCalls.length >= 3, `expected the npm calls to be covered, saw ${npmCalls.length}`);
-  for (const call of npmCalls) {
-    assert.equal(call.cwd, home, `npm ${call.args} must run from the home directory`);
+  // The exact set, not a minimum count: a floor of "at least three" passes even
+  // when one of them loses its cwd, and says nothing about a call site added
+  // later.
+  assert.deepEqual(
+    seen.filter((call) => call.cmd === "npm").map((call) => `${call.args} @ ${call.cwd}`),
+    [
+      `view gforge version @ ${home}`,
+      `install -g gforge@latest @ ${home}`,
+      `root -g @ ${home}`
+    ]
+  );
+
+  // The re-exec of the freshly installed binary is also a spawn, but it runs
+  // node against an absolute script path, so there is no unqualified name for
+  // cmd.exe to resolve against the current directory - and it should keep
+  // running where the developer invoked the command.
+  const reexec = seen.find((call) => call.cmd !== "npm");
+  assert.equal(reexec.cwd, undefined);
+});
+
+test("issue #78: every npm call site in src/ passes a cwd, including the background worker", async () => {
+  // The worker in scanner.js is the call issue #78 actually names, and it is
+  // unreachable from a unit test: it is not exported, and it spawns npm for
+  // real. Without this the suite stayed green when its cwd was removed.
+  //
+  // So the invariant is asserted against the source itself, which also covers
+  // `npm config get registry` and any call site added later - the previous test
+  // could only ever see the three it drives by hand.
+  const sources = ["../src/npm-update.js", "../src/scanner.js"];
+  const callSites = [];
+
+  for (const relative of sources) {
+    const file = fileURLToPath(new URL(relative, import.meta.url));
+    const source = await readFile(file, "utf8");
+    const lines = source.split("\n");
+
+    lines.forEach((line, index) => {
+      if (!line.includes('("npm", [')) return;
+      // The options object runs from this line to the line that closes the
+      // call, which is the first `});` at or after it.
+      const end = lines.findIndex((l, i) => i >= index && /^\s*}\s*\)/.test(l));
+      const call = lines.slice(index, end === -1 ? index + 1 : end + 1).join("\n");
+      callSites.push({
+        where: `${relative.replace("../", "")}:${index + 1}`,
+        hasCwd: /\bcwd:\s*(?:homedir\(\)|npmCwd\(\))/.test(call)
+      });
+    });
   }
-  // The install itself is the highest-value one to get right.
-  assert.ok(npmCalls.some((c) => c.args.startsWith("install -g")), "expected the install call to be covered");
+
+  // Guard the guard: if the shape of these calls ever changes so that none are
+  // found, this test must not quietly pass while checking nothing.
+  assert.ok(callSites.length >= 5, `expected to find the npm call sites, found ${callSites.length}`);
+  assert.deepEqual(
+    callSites.filter((site) => !site.hasCwd),
+    [],
+    "every npm invocation must pass cwd: homedir()"
+  );
+});
+
+test("issue #78: a home directory that cannot be entered is reported, not swallowed", async () => {
+  // Every npm call now depends on the cwd existing. spawnSync reports a failure
+  // to start the child in `error` and leaves status null, so the old message
+  // was "exited with status null", which tells the user nothing about why.
+  const result = await performSelfUpgrade("update", "1.2.3", {
+    spawnSync: () => ({ error: Object.assign(new Error("spawnSync npm ENOENT"), { code: "ENOENT" }), status: null })
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /could not start \(ENOENT\)/);
+  assert.match(result.error, new RegExp(homedir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(result.error, /status null/);
 });
