@@ -294,9 +294,18 @@ export async function verifyManagedHooks(options = {}) {
 
   const preCommitPath = resolvePreCommitPath(environment.home.path);
   // The node path the installer baked into the shim, so the check can compare
-  // against exactly what was written rather than guessing (issue #82).
-  const { state } = await readStateFile(resolveStatePath(environment.home.path));
-  checks.push(await checkPreCommitShim(preCommitPath, state?.nodePath ?? null));
+  // against exactly what was written rather than guessing. readStateFile
+  // rethrows anything that is not ENOENT, and verify is read-only: an
+  // unreadable state file must not crash the command, it must leave the shim
+  // unverifiable, which checkPreCommitShim reports as a failure (issue #82).
+  let recordedNodePath = null;
+  try {
+    const { state } = await readStateFile(resolveStatePath(environment.home.path));
+    recordedNodePath = state?.nodePath ?? null;
+  } catch {
+    recordedNodePath = null;
+  }
+  checks.push(await checkPreCommitShim(preCommitPath, recordedNodePath));
   checks.push(await checkHookExecutable(PRE_COMMIT_FILE_NAME, preCommitPath, environment.platform.name));
 
   return {
@@ -329,61 +338,116 @@ async function checkScannerContent(scannerPath) {
   }
 }
 
-// The pre-commit shim embeds a machine-specific Node path, so verify checks its
-// structure (present and delegating to the managed scanner) rather than an
-// exact byte match.
-// Does this hook actually RUN the scanner, as opposed to merely mentioning it?
-// The old check was `includes(SCANNER_FILE_NAME) && includes("exec")`, which a
-// two-line no-op satisfies:
+// Does this hook actually REACH an exec of the scanner, as opposed to merely
+// containing the words somewhere? The original check was
+// `includes(SCANNER_FILE_NAME) && includes("exec")`, which a two-line no-op
+// satisfies:
 //
 //     #!/bin/sh
 //     # exec gforge-scan.mjs
 //     exit 0
 //
-// That reported PASS while nothing was scanned (issue #82). Comment lines are
-// stripped before looking, and the exec has to be a real statement invoking the
-// resolved scanner path.
+// This never decides that a hook is GOOD - `checkPreCommitShim` has already
+// compared bytes by then, and only a byte match can PASS. It decides how bad a
+// mismatch is: a hook that still runs the scanner is stale, while one that
+// cannot reach the exec is scanning nothing and must be reported as blocking.
+// So existence was never the question, reachability is: an `exit 0` spliced in
+// above the real lines, or the real lines parked inside `if false` or a
+// function nobody calls, leaves every substring in place and runs nothing.
+//
+// A shell parser does not belong in a verify check, so this tracks block depth
+// with keywords and requires the exec at top level with no earlier top-level
+// exit. Anything it cannot follow falls through to `false`, which is the strict
+// answer here: unrecognised structure is reported as not scanning (issue #82).
+const BLOCK_OPENERS = /\b(?:if|for|while|until|case)\b|\{/g;
+const BLOCK_CLOSERS = /\b(?:fi|done|esac)\b|\}/g;
+const SCANNER_EXEC_RE = /\bexec\b.*\$(?:SCANNER\b|\{SCANNER[}:])/;
+
+// Structure is counted on the line with quoted spans blanked out, because the
+// hook's own error message says "no Node.js runtime found to scan for secrets",
+// and those two `for`s would otherwise read as two opened blocks. Double quotes
+// are removed first so an apostrophe inside one cannot start a single-quoted
+// span. Content matching still uses the real line: the scanner path and
+// $SCANNER both live inside quotes.
+function shellSkeleton(line) {
+  return line.replace(/"[^"]*"/g, " ").replace(/'[^']*'/g, " ");
+}
+
 export function hookInvokesScanner(content) {
   const statements = String(content ?? "")
     .split(/\r?\n/)
     .map((line) => line.replace(/#.*$/, "").trim())
     .filter(Boolean);
 
-  const resolvesScanner = statements.some(
-    (line) => /\bSCANNER=/.test(line) && line.includes(SCANNER_FILE_NAME)
-  );
-  const execsScanner = statements.some((line) => /\bexec\b/.test(line) && /\$(?:SCANNER|\{SCANNER\})/.test(line));
-  return resolvesScanner && execsScanner;
+  let depth = 0;
+  let resolvesScanner = false;
+
+  for (const line of statements) {
+    const skeleton = shellSkeleton(line);
+
+    if (depth === 0) {
+      // The exec settles it, and it must come after the line that resolves the
+      // path - an exec of an unset $SCANNER runs nothing.
+      if (SCANNER_EXEC_RE.test(line)) return resolvesScanner;
+      // A top-level exit short-circuits the hook before the scanner is reached.
+      // Checked after the exec so a genuine `exec ... || exit 1` still counts.
+      if (/\bexit\b/.test(skeleton)) return false;
+      if (/\bSCANNER=/.test(line) && line.includes(SCANNER_FILE_NAME)) resolvesScanner = true;
+    }
+
+    depth += (skeleton.match(BLOCK_OPENERS) || []).length - (skeleton.match(BLOCK_CLOSERS) || []).length;
+    if (depth < 0) return false; // unbalanced: not something to reason about
+  }
+
+  return false;
 }
 
+// The engine file is compared byte-for-byte, and the shim now gets the same
+// treatment. The node path is the only machine-specific part, and the installer
+// records the one it baked in, so the comparison stays exact even after the
+// user's node moves (the shim resolves PATH first, so a stale baked path still
+// works and must not read as tampering).
+//
+// There is deliberately NO weaker path that can return PASS. An earlier revision
+// fell back to a structural check when the recorded node path was missing, but
+// that made the weak check selectable by whoever it was defending against:
+// state.json sits next to the hook with the same permissions, so deleting one
+// field from it downgraded the check on a hook that scans nothing. A missing
+// node path means the install was disturbed, so it is reported as unverifiable
+// rather than waved through - `gforge update` rewrites both files (issue #82).
 async function checkPreCommitShim(preCommitPath, nodePath) {
   const label = `${PRE_COMMIT_FILE_NAME}-content`;
   let content;
   try {
     content = await readFile(preCommitPath, "utf8");
   } catch {
-    return { status: "FAIL", label, detail: `${preCommitPath} not found` };
+    // No hook at all: nothing is scanned, so this is not merely a failed check.
+    return { status: "FAIL", label, blocking: true, detail: `${preCommitPath} not found` };
   }
 
-  // Preferred: the same byte-for-byte comparison the scanner engine already
-  // gets. The node path is the only machine-specific part, and the installer
-  // records the one it baked in, so this stays exact even after the user's node
-  // moves (the shim tries PATH first, so a stale baked path still works).
-  if (nodePath) {
-    const expected = getManagedFiles(nodePath).find((file) => file.name === PRE_COMMIT_FILE_NAME)?.content;
-    if (expected !== undefined) {
-      return content === expected
-        ? { status: "PASS", label, detail: "matches the managed hook" }
-        : { status: "FAIL", label, detail: "hook has been modified or is stale - run `gforge update`" };
-    }
+  const expected = nodePath
+    ? getManagedFiles(nodePath).find((file) => file.name === PRE_COMMIT_FILE_NAME)?.content
+    : undefined;
+
+  if (expected !== undefined && content === expected) {
+    return { status: "PASS", label, detail: "matches the managed hook" };
   }
 
-  // Fallback for an install whose state file predates the recorded node path,
-  // or is unreadable: structural rather than exact, but still requires a real
-  // invocation rather than the substrings appearing anywhere.
-  return hookInvokesScanner(content)
-    ? { status: "PASS", label, detail: "delegates to managed scanner" }
-    : { status: "FAIL", label, detail: "does not delegate to managed scanner" };
+  // Past here the hook is not what GForge wrote. Whether that is a stale shim
+  // or a neutered one decides the severity: `blocking` drives the "Not
+  // protected" headline and the non-zero exit, and must be claimed only when
+  // the hook genuinely cannot reach the scanner.
+  const stillScans = hookInvokesScanner(content);
+  const detail =
+    expected === undefined
+      ? "install state has no recorded node path, so the hook cannot be verified - run `gforge update`"
+      : stillScans
+        ? "hook has been modified or is stale - run `gforge update`"
+        : "hook does not run the scanner - no commit is being scanned - run `gforge install`";
+
+  return stillScans
+    ? { status: "FAIL", label, detail }
+    : { status: "FAIL", label, blocking: true, detail };
 }
 
 export function formatInstallResult(result) {

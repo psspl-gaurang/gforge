@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { createVerificationReport, formatVerificationReport } from "../src/verify.js";
 import {
   hookInvokesScanner,
   installManagedHooks,
@@ -478,7 +479,76 @@ test("issue #82: a no-op hook that merely mentions the scanner does not verify",
   const report = await verifyManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
   const shim = report.checks.find((check) => check.label === `${PRE_COMMIT_FILE_NAME}-content`);
   assert.equal(shim.status, "FAIL");
-  assert.match(shim.detail, /modified|does not delegate/);
+  // A hook that cannot reach the scanner is not merely a failed check: nothing
+  // is being scanned, so it has to carry the "Not protected" headline.
+  assert.equal(shim.blocking, true);
+  assert.match(shim.detail, /no commit is being scanned/);
+
+  const verification = createVerificationReport(createEnvironment(homePath), report);
+  assert.equal(
+    verification.blocking.some((check) => check.label === `${PRE_COMMIT_FILE_NAME}-content`),
+    true
+  );
+  assert.equal(verification.exitCode, 1);
+  assert.match(formatVerificationReport(verification), /Not protected: .*pre-commit-content/);
+});
+
+test("issue #82: the shim is compared byte-for-byte, and that is the only way to PASS", async () => {
+  // Pins the headline change rather than the fallback's behaviour: an earlier
+  // revision kept a structural check that happened to accept a genuine hook and
+  // reject the stub, so deleting the byte comparison outright left the suite
+  // green. Asserting the detail string makes that mutation visible.
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  const shim = await shimCheckFor(homePath, git);
+  assert.equal(shim.status, "PASS");
+  assert.equal(shim.detail, "matches the managed hook");
+  assert.equal(shim.blocking, undefined);
+});
+
+test("issue #82: removing the recorded node path cannot downgrade the check", async () => {
+  // state.json sits beside the hook with the same permissions, so whoever can
+  // rewrite one can edit the other. A missing node path means the install was
+  // disturbed: the shim becomes unverifiable, never waved through.
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  const statePath = resolveStatePath(homePath);
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  delete state.nodePath;
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+  // The hook itself is untouched and genuinely runs the scanner, so this is the
+  // most favourable case for the attacker - and it still must not PASS.
+  const untouched = await shimCheckFor(homePath, git);
+  assert.equal(untouched.status, "FAIL");
+  assert.match(untouched.detail, /no recorded node path/);
+  // It still runs the scanner, so it is not claimed to be unprotected.
+  assert.equal(untouched.blocking, undefined);
+
+  // And with the hook neutered as well, the state edit buys nothing.
+  await writeFile(resolvePreCommitPath(homePath), "#!/bin/sh\n# exec gforge-scan.mjs\nexit 0\n");
+  const neutered = await shimCheckFor(homePath, git);
+  assert.equal(neutered.status, "FAIL");
+  assert.equal(neutered.blocking, true);
+});
+
+test("issue #82: an unreadable state file fails the shim check instead of crashing verify", async () => {
+  // readStateFile rethrows anything that is not ENOENT, and verify is read-only:
+  // a corrupt or unreadable state file must leave the shim unverifiable, not
+  // take the whole command down.
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  await writeFile(resolveStatePath(homePath), "{ not json");
+
+  const shim = await shimCheckFor(homePath, git);
+  assert.equal(shim.status, "FAIL");
+  assert.match(shim.detail, /no recorded node path/);
 });
 
 test("issue #82: an untouched install still verifies, and any edit to the hook is caught", async () => {
@@ -488,36 +558,70 @@ test("issue #82: an untouched install still verifies, and any edit to the hook i
   const path = resolvePreCommitPath(homePath);
   const original = await readFile(path, "utf8");
 
-  const shimCheck = async () => {
-    const report = await verifyManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
-    return report.checks.find((check) => check.label === `${PRE_COMMIT_FILE_NAME}-content`);
-  };
-
-  assert.equal((await shimCheck()).status, "PASS");
+  assert.equal((await shimCheckFor(homePath, git)).status, "PASS");
 
   // Neutering the invocation while leaving everything else intact.
   await writeFile(path, original.replace('exec "$NODE" "$SCANNER" pre-commit', "exit 0"));
-  assert.equal((await shimCheck()).status, "FAIL");
+  const neutered = await shimCheckFor(homePath, git);
+  assert.equal(neutered.status, "FAIL");
+  assert.equal(neutered.blocking, true);
+
+  // Editing only the baked node path: the hook still runs the scanner, so it
+  // fails as modified rather than as unprotected.
+  await writeFile(path, buildPreCommitHook("/somewhere/else/node"));
+  const repathed = await shimCheckFor(homePath, git);
+  assert.equal(repathed.status, "FAIL");
+  assert.match(repathed.detail, /modified or is stale/);
+  assert.equal(repathed.blocking, undefined);
 
   await writeFile(path, original);
-  assert.equal((await shimCheck()).status, "PASS");
+  assert.equal((await shimCheckFor(homePath, git)).status, "PASS");
 });
 
-test("issue #82: the structural fallback still requires a real invocation", () => {
-  // Used when an install's state file predates the recorded node path, so the
-  // exact comparison is not available. Weaker than byte equality, but it must
-  // not accept a hook that only talks about the scanner.
-  assert.equal(hookInvokesScanner(buildPreCommitHook("/usr/bin/node")), true);
+test("issue #82: reachability, not the presence of the right-looking lines", () => {
+  // hookInvokesScanner never grants a PASS - the byte comparison has already
+  // run by then - it decides whether a mismatched hook is stale or is scanning
+  // nothing. Existence was never the question: every hook below contains a
+  // SCANNER= line and an exec of it, and only the first one runs.
+  const real = buildPreCommitHook("/usr/bin/node");
+  assert.equal(hookInvokesScanner(real), true);
 
+  assert.equal(hookInvokesScanner(real.replace("set -u", "set -u\nexit 0")), false);
+  assert.equal(hookInvokesScanner(real.replace("set -u", "set -u\ntrue && exit 0")), false);
+  assert.equal(
+    hookInvokesScanner(
+      '#!/bin/sh\nif false; then\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\nexec "$NODE" "$SCANNER" pre-commit\nfi\n'
+    ),
+    false
+  );
+  assert.equal(
+    hookInvokesScanner(
+      '#!/bin/sh\nscan() {\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\nexec "$NODE" "$SCANNER" pre-commit\n}\nexit 0\n'
+    ),
+    false
+  );
+  // An exec that runs before anything resolves the path runs nothing.
+  assert.equal(
+    hookInvokesScanner('#!/bin/sh\nexec "$NODE" "$SCANNER" pre-commit\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\n'),
+    false
+  );
+
+  // The original substring bypass, and its half-measures.
   assert.equal(hookInvokesScanner("#!/bin/sh\n# exec gforge-scan.mjs\nexit 0\n"), false);
   assert.equal(hookInvokesScanner('#!/bin/sh\n# SCANNER="gforge-scan.mjs"; exec "$SCANNER"\nexit 0\n'), false);
-  // Half-measures fail too: an exec with nothing resolving the scanner path,
-  // and a resolved path that is never executed.
   assert.equal(hookInvokesScanner('#!/bin/sh\nexec "$NODE" "$SCANNER"\n'), false);
   assert.equal(hookInvokesScanner('#!/bin/sh\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\nexit 0\n'), false);
-  // A trailing comment on a genuine exec line is still a genuine exec line.
+
+  // A trailing comment on a genuine exec line is still a genuine exec line, and
+  // a quoted `for` or `exit` in a message is prose, not shell structure.
   assert.equal(
     hookInvokesScanner('#!/bin/sh\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\nexec "$NODE" "$SCANNER" pre-commit # go\n'),
+    true
+  );
+  assert.equal(
+    hookInvokesScanner(
+      '#!/bin/sh\nSCANNER="$HOOK_DIR/gforge-scan.mjs"\necho "scanning for secrets; exit if none"\nexec "$NODE" "$SCANNER"\n'
+    ),
     true
   );
 });
@@ -710,6 +814,11 @@ test("issue #41: no warning when there is no classic hook file, it isn't executa
 
 async function createTempHome() {
   return mkdtemp(join(tmpdir(), "gforge-test-"));
+}
+
+async function shimCheckFor(homePath, git) {
+  const report = await verifyManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  return report.checks.find((check) => check.label === `${PRE_COMMIT_FILE_NAME}-content`);
 }
 
 function createEnvironment(homePath) {
