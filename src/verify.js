@@ -1,6 +1,11 @@
 import { MIN_NODE_MAJOR } from "./environment.js";
 
-export function createVerificationReport(environment, managedHooksReport = null, dotenvReport = null) {
+export function createVerificationReport(
+  environment,
+  managedHooksReport = null,
+  dotenvReport = null,
+  sharedAllowlistReport = null
+) {
   const checks = [
     {
       status: environment.platform.supported ? "PASS" : "FAIL",
@@ -28,7 +33,8 @@ export function createVerificationReport(environment, managedHooksReport = null,
   const allChecks = [
     ...checks,
     ...(managedHooksReport ? managedHooksReport.checks : []),
-    ...dotenvChecks(dotenvReport)
+    ...dotenvChecks(dotenvReport),
+    ...sharedAllowlistChecks(sharedAllowlistReport)
   ];
 
   // A WARN normally means "worth knowing, still protected" — an unsupported
@@ -48,6 +54,38 @@ export function createVerificationReport(environment, managedHooksReport = null,
     blocking,
     exitCode: allChecks.some((check) => check.status === "FAIL") || blocking.length > 0 ? 1 : 0
   };
+}
+
+// The shared allowlist is the one configuration that makes GForge scan LESS, and
+// it lives outside the repository, so nothing in a project's own files hints
+// that it is in effect. Reported for the same reason a shadowed hooksPath is:
+// a developer looking at a clean verify should be able to see what is being
+// skipped and where that came from (issue #94). Counts and the path only -
+// never the entries.
+//
+// Not `blocking`: an allowlist is a deliberate choice, not a protection gap.
+// A refused entry is a WARN because it silently stopped allowlisting, which is
+// the safe direction but not the one its author intended.
+function sharedAllowlistChecks(report) {
+  if (!report || !report.present) return [];
+
+  const label = "shared-allowlist";
+  if (report.refusedCount > 0) {
+    return [{
+      status: "WARN",
+      label,
+      detail:
+        `${report.entryCount} entr(ies) from ${report.path}, ` +
+        `${report.refusedCount} refused as too long or catastrophically backtracking - ` +
+        "those fall back to substring matching"
+    }];
+  }
+
+  return [{
+    status: "PASS",
+    label,
+    detail: `${report.entryCount} entr(ies) from ${report.path}`
+  }];
 }
 
 // The .env cross-reference is the scanner's highest-precision layer, and it is

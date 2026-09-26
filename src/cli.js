@@ -14,7 +14,7 @@ import {
   performSelfUpgrade,
   readCachedUpdateNotice
 } from "./npm-update.js";
-import { describeDotenvSources } from "./scanner.js";
+import { describeDotenvSources, describeSharedAllowlist } from "./scanner.js";
 import { runSettingsCommand } from "./settings.js";
 import { createVerificationReport, formatVerificationReport } from "./verify.js";
 
@@ -50,7 +50,10 @@ export async function runCli(args, streams, options = {}) {
       environment
     });
     const dotenvReport = (options.describeDotenvSources ?? describeDotenvSources)();
-    const report = createVerificationReport(environment, managedHooksReport, dotenvReport);
+    const sharedAllowlistReport = (options.describeSharedAllowlist ?? describeSharedAllowlist)(
+      environment.home.path
+    );
+    const report = createVerificationReport(environment, managedHooksReport, dotenvReport, sharedAllowlistReport);
 
     streams.stdout.write(formatVerificationReport(report));
     const notice = (options.readCachedUpdateNotice ?? readCachedUpdateNotice)(VERSION);

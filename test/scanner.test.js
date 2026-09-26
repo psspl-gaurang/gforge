@@ -15,7 +15,9 @@ import {
   isExpectedGitReadFailure,
   isHeuristicExemptPath,
   isEnvTemplate,
+  describeSharedAllowlist,
   isRiskyAllowlistPattern,
+  loadSharedAllowlist,
   loadDotenvSecrets,
   matchFilenameRule,
   parseAllowlist,
@@ -609,6 +611,56 @@ test("issue #31: a rejected pattern makes the entry inert rather than hiding fil
   // The valid entry alongside it keeps working.
   const skipped = scanStaged({ ...opts, allowlist, files: ["config.txt"], read });
   assert.equal(skipped.findings.length, 0);
+});
+
+test("issue #94: a shared allowlist applies without a per-repo .gforgeignore", () => {
+  const home = mkdtempSync(join(tmpdir(), "gforge-shared-"));
+  // Absent is the normal case, and must not disturb anything.
+  assert.deepEqual(loadSharedAllowlist(home), { present: false, patterns: [], entryCount: 0, refusedCount: 0 });
+  assert.equal(describeSharedAllowlist(home).present, false);
+
+  mkdirSync(join(home, ".gforge"), { recursive: true });
+  writeFileSync(
+    join(home, ".gforge", "allowlist"),
+    "# shared across the org\ninternal-tooling/fixtures/\n^vendor/acme/.*\n"
+  );
+
+  const shared = loadSharedAllowlist(home);
+  assert.equal(shared.present, true);
+  assert.equal(shared.entryCount, 2); // the comment is not an entry
+  assert.equal(shared.refusedCount, 0);
+
+  // Same semantics as .gforgeignore: regex, falling back to substring.
+  const read = () => "DB_PASS=psspl@443e";
+  const base = { ...opts, dotenvSecrets: [], read };
+  assert.equal(scanStaged({ ...base, allowlist: shared.patterns, files: ["internal-tooling/fixtures/a.txt"] }).findings.length, 0);
+  assert.equal(scanStaged({ ...base, allowlist: shared.patterns, files: ["vendor/acme/b.txt"] }).findings.length, 0);
+  // A path it does not cover is still scanned.
+  assert.ok(scanStaged({ ...base, allowlist: shared.patterns, files: ["src/app.ts"] }).findings.length > 0);
+});
+
+test("issue #94: a risky shared entry is refused and counted, never silently obeyed", () => {
+  // Same guard as the per-repo file (issue #31). The entry falls back to
+  // substring matching, so it loses its allowlisting power - the safe
+  // direction - and the count is what lets verify say so out loud.
+  const home = mkdtempSync(join(tmpdir(), "gforge-shared-risky-"));
+  mkdirSync(join(home, ".gforge"), { recursive: true });
+  writeFileSync(join(home, ".gforge", "allowlist"), `${CATASTROPHIC_PATTERN}\nfixtures/\n`);
+
+  const shared = loadSharedAllowlist(home);
+  assert.equal(shared.entryCount, 2);
+  assert.equal(shared.refusedCount, 1);
+
+  const read = () => "DB_PASS=psspl@443e";
+  const base = { ...opts, dotenvSecrets: [], read, allowlist: shared.patterns };
+  // The path the risky pattern would have matched is still scanned.
+  assert.ok(scanStaged({ ...base, files: ["aaaa.txt"] }).findings.length > 0);
+  // The valid entry alongside it keeps working.
+  assert.equal(scanStaged({ ...base, files: ["fixtures/a.txt"] }).findings.length, 0);
+
+  const described = describeSharedAllowlist(home);
+  assert.equal(described.refusedCount, 1);
+  assert.match(described.path, /allowlist$/);
 });
 
 test("inline gforge:allow suppresses a line", () => {

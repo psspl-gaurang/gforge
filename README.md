@@ -187,18 +187,41 @@ Maximum coverage occasionally flags something safe. Three escape hatches:
   ^docs/sample-config\.md$
   ```
 
+- **Org-wide:** put the same kind of entries in `~/.gforge/allowlist`. They apply
+  in every repository on the machine, so a team's common false positives
+  (shared internal tooling paths, vendored fixtures) are defined once instead of
+  copied into every `.gforgeignore`:
+
+  ```gitignore
+  # ~/.gforge/allowlist
+  internal-tooling/fixtures/
+  ^vendor/acme/.*
+  ```
+
+  An organization distributes this file with whatever configuration management
+  it already uses, or symlinks it into a managed checkout so updates flow
+  without re-copying. GForge never fetches it over the network — that would put
+  the network on the commit path and let whoever serves the file silence
+  scanning everywhere at once.
+
+  Because this is the one setting that makes GForge scan *less*, and it lives
+  outside the repository, `gforge verify` reports it — how many entries are
+  active and where they came from — so a clean report never hides it.
+
 - **One-off:** bypass a single commit with `git commit --no-verify`.
 
 Each non-comment line is treated as a regular expression, falling back to a
-plain substring match when it is not valid regex syntax.
+plain substring match when it is not valid regex syntax. This is the same in the
+per-repo and org-wide files.
 
-Because these files live in the repository, cloning an untrusted repo means
-inheriting its allowlist. Two limits apply so that a hostile or simply careless
-entry cannot stall your commits: patterns are capped at 200 characters, and
-patterns with nested unbounded quantifiers (`(a+)+`, `(a*)*`) are refused —
-those backtrack catastrophically and would otherwise hang the hook. A refused
-pattern falls back to substring matching, so it loses its allowlisting power
-rather than silently hiding files.
+Because the per-repo files live in the repository, cloning an untrusted repo
+means inheriting its allowlist. Two limits apply — to both the per-repo and the
+org-wide file — so that a hostile or simply careless entry cannot stall your
+commits: patterns are capped at 200 characters, and patterns with nested
+unbounded quantifiers (`(a+)+`, `(a*)*`) are refused — those backtrack
+catastrophically and would otherwise hang the hook. A refused pattern falls back
+to substring matching, so it loses its allowlisting power rather than silently
+hiding files, and `gforge verify` warns when the org-wide file contains one.
 
 ## Staying up to date
 
@@ -264,7 +287,9 @@ Behavior is controlled through the environment variables below.
 GForge keeps its own state under `~/.gforge` — the managed hooks, an install
 state file, and an update-check cache. Those are managed for you by
 `install` / `update` / `uninstall` and are not meant to be edited by hand, so
-there is nothing to set up before the table below applies.
+there is nothing to set up before the table below applies. The one file in there
+you may write yourself is `allowlist`, the optional
+[org-wide allowlist](#managing-false-positives).
 
 | Variable | Effect |
 | --- | --- |
