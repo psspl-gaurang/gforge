@@ -260,3 +260,108 @@ function createWritable() {
     }
   };
 }
+
+test("issue #32: a failing environment short-circuits before any network work", async () => {
+  // The self-upgrade check is a registry round-trip that can take seconds. On a
+  // machine without git the command was always going to fail, so paying for
+  // that first is pure latency ahead of an error the environment already
+  // determined. Worse, the old order did not stop at the round-trip - it went
+  // on to run the whole `npm install -g` self-upgrade too.
+  const order = [];
+  const streams = createStreams();
+
+  const result = await runCli(["install"], streams, {
+    readCachedUpdateNotice: () => null,
+    detectEnvironment: async () => {
+      order.push("detectEnvironment");
+      return {
+        platform: { name: "linux", arch: "x64", supported: true, isWsl: false },
+        home: { path: "/home/example", present: true },
+        shell: { path: "/bin/bash", name: "bash", supported: true },
+        git: { available: false, version: null, rawVersion: null, errorCode: "ENOENT" },
+        node: { version: "20.11.0", major: 20, supported: true }
+      };
+    },
+    getLatestVersion: async () => {
+      order.push("network:getLatestVersion");
+      return "9.9.9";
+    },
+    performSelfUpgrade: async () => {
+      order.push("network:performSelfUpgrade");
+      return { ok: true };
+    },
+    installManagedHooks: async () => {
+      order.push("installManagedHooks");
+      return { ok: false, exitCode: 1, hooksDirectory: null, messages: ["Git is required but was not found."] };
+    }
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(order, ["detectEnvironment"]);
+  assert.match(streams.stderr.value, /Git is required/);
+});
+
+test("issue #32: an unsupported platform also fails before the network", async () => {
+  const order = [];
+  const streams = createStreams();
+
+  const result = await runCli(["update"], streams, {
+    readCachedUpdateNotice: () => null,
+    detectEnvironment: async () => ({
+      platform: { name: "sunos", arch: "sparc", supported: false, isWsl: false },
+      home: { path: "/home/example", present: true },
+      shell: { path: "/bin/bash", name: "bash", supported: true },
+      git: { available: true, version: "2.45.0", rawVersion: "git version 2.45.0" },
+      node: { version: "20.11.0", major: 20, supported: true }
+    }),
+    getLatestVersion: async () => {
+      order.push("network");
+      return "9.9.9";
+    },
+    updateManagedHooks: async () => {
+      order.push("updateManagedHooks");
+      return { ok: true, exitCode: 0, messages: [] };
+    }
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(order, []);
+  assert.match(streams.stderr.value, /Unsupported platform/);
+});
+
+test("issue #32: a healthy environment still upgrades, and is detected only once", async () => {
+  // The guard must not cost the normal path anything, and the environment it
+  // already resolved is reused by the install rather than detected again.
+  let detections = 0;
+  const order = [];
+  const streams = createStreams();
+  const healthy = {
+    platform: { name: "linux", arch: "x64", supported: true, isWsl: false },
+    home: { path: "/home/example", present: true },
+    shell: { path: "/bin/bash", name: "bash", supported: true },
+    git: { available: true, version: "2.45.0", rawVersion: "git version 2.45.0" },
+    node: { version: "20.11.0", major: 20, supported: true }
+  };
+
+  const result = await runCli(["install"], streams, {
+    readCachedUpdateNotice: () => null,
+    detectEnvironment: async () => {
+      detections += 1;
+      order.push("detectEnvironment");
+      return healthy;
+    },
+    getLatestVersion: async () => {
+      order.push("network:getLatestVersion");
+      return null; // already current
+    },
+    installManagedHooks: async (opts) => {
+      order.push("installManagedHooks");
+      assert.equal(opts.environment, healthy, "the install should reuse the environment already detected");
+      return { ok: true, exitCode: 0, hooksDirectory: "/home/example/.gforge/hooks", messages: ["ok"] };
+    }
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(order, ["detectEnvironment", "network:getLatestVersion", "installManagedHooks"]);
+  assert.equal(detections, 1);
+});

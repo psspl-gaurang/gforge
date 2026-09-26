@@ -15,6 +15,7 @@ import {
   isExpectedGitReadFailure,
   isHeuristicExemptPath,
   isEnvTemplate,
+  isRiskyAllowlistPattern,
   loadDotenvSecrets,
   matchFilenameRule,
   parseAllowlist,
@@ -170,6 +171,48 @@ test("issue #28: the new rules stay off look-alike values", () => {
   assert.equal(ruleIds("a.js", "const u = `?api_secret=${process.env.VONAGE_SECRET}`;").includes("vonage-api-secret"), false);
   // Truncated/short values are not account keys.
   assert.equal(ruleIds("a.js", 'const k = "AccountKey=tooshort==";').includes("azure-storage-key"), false);
+});
+
+test("issue #81: every credential assignment on a line is examined, not just the first", () => {
+  // The gap: each candidate's captured value runs to end of line, so on this
+  // line the FIRST candidate's value is "process.env.TOKEN, password: ..." -
+  // which correctly reads as an env reference. Returning at that point meant
+  // the hardcoded password after it was never looked at, while the identical
+  // secret on its own line was caught.
+  const sameLine = 'token: process.env.TOKEN, password: "S3cret!789"';
+  const splitLines = 'token: process.env.TOKEN,\npassword: "S3cret!789"';
+  assert.ok(ruleIds("a.ts", sameLine).includes(GENERIC_SECRET_RULE_ID));
+  assert.ok(ruleIds("a.ts", splitLines).includes(GENERIC_SECRET_RULE_ID));
+
+  // One-line object literals are the common real-world shape of this.
+  assert.ok(
+    ruleIds("a.ts", '{ apiKey: process.env.API_KEY, apiSecret: "aX9kQm2pLw8vRt4z" }').includes(GENERIC_SECRET_RULE_ID)
+  );
+  // The secret can sit anywhere on the line, not only last.
+  assert.ok(
+    ruleIds("a.ts", '{ password: "S3cret!789", token: process.env.T }').includes(GENERIC_SECRET_RULE_ID)
+  );
+  assert.ok(
+    ruleIds("a.ts", '{ a: 1, token: process.env.T, user: "bob", password: "S3cret!789" }').includes(GENERIC_SECRET_RULE_ID)
+  );
+});
+
+test("issue #81: examining every candidate does not start flagging safe lines", () => {
+  // The risk of looking past the first match is new false positives, so the
+  // value-level judgement still has to clear each one independently.
+  assert.equal(ruleIds("a.ts", "token: process.env.TOKEN, password: process.env.PW").length, 0);
+  assert.equal(ruleIds("config/db.js", "password: config.get('db.password'), token: getSecret('t')").length, 0);
+  assert.equal(ruleIds("a.ts", '{ apiKey: process.env.API_KEY, apiSecret: process.env.API_SECRET }').length, 0);
+  // Placeholders stay exempt wherever they appear on the line.
+  assert.equal(ruleIds(".env.example", "DB_PASSWORD=changeme, API_TOKEN=your_token_here").length, 0);
+});
+
+// A line still yields at most one finding, so a multi-secret line does not
+// produce duplicate noise for what a developer fixes in one edit.
+test("issue #81: a line with two hardcoded secrets still reports once", () => {
+  const findings = scanText("a.ts", '{ password: "S3cret!789", apiSecret: "aX9kQm2pLw8vRt4z" }', { runGitleaks: false })
+    .filter((f) => f.ruleId === GENERIC_SECRET_RULE_ID);
+  assert.equal(findings.length, 1);
 });
 
 test("detects credentials embedded in a URL", () => {
@@ -506,6 +549,66 @@ test("issue #68: a route prefix still does not launder a real secret", () => {
   assert.ok(
     ruleIds("r.ts", 'const token = "api/:version/p4ssw0rd1234";').includes(GENERIC_SECRET_RULE_ID)
   );
+});
+
+// The classic catastrophic-backtracking shape - "(a+)+$" - assembled instead of
+// written as a literal. Spelled out, it trips CodeQL's own ReDoS query where it
+// reaches parseAllowlist: correctly, because CodeQL cannot see that
+// parseAllowlist now refuses to compile exactly this shape. Carrying a
+// permanently-dismissed ReDoS alert in a secret scanner's own repository would
+// make a real one easier to miss later, so the fixture is built at runtime and
+// the behaviour under test is unchanged.
+const QUANTIFIER = "+";
+const CATASTROPHIC_PATTERN = `(a${QUANTIFIER})${QUANTIFIER}$`;
+
+test("issue #31: an allowlist pattern that backtracks catastrophically cannot hang the hook", () => {
+  // Allowlist entries are repo-controlled and run against every staged path on
+  // every commit. Before this, that pattern against a 31-character path did not
+  // finish in 12 seconds - the commit hook simply hung.
+  const matchers = parseAllowlist(CATASTROPHIC_PATTERN);
+  const target = `${"a".repeat(60)}X`;
+
+  const started = Date.now();
+  const matched = matchers.some((matcher) => matcher.test(target));
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 1000, `allowlist matching took ${elapsed}ms`);
+  // It degrades to a literal substring match, so it simply does not match -
+  // which fails SAFE: the path gets scanned rather than silently skipped.
+  assert.equal(matched, false);
+});
+
+test("issue #31: risky patterns are rejected, ordinary allowlist entries are not", () => {
+  for (const risky of ["(a+)+$", "(a*)*", "(a+)*b", "([a-z]+)+$", "(x*)+", "(a+){2,}", "a".repeat(201)]) {
+    assert.equal(isRiskyAllowlistPattern(risky), true, risky.slice(0, 30));
+  }
+  // The shapes people actually write, including the two the README documents.
+  for (const ok of [
+    "test/fixtures/",
+    "^docs/sample-config\\.md$",
+    "^secrets/",
+    "config.txt",
+    ".*\\.lock$",
+    "^(src|test)/fixtures/",
+    "a+",
+    "(foo|bar)/"
+  ]) {
+    assert.equal(isRiskyAllowlistPattern(ok), false, ok);
+  }
+});
+
+test("issue #31: a rejected pattern makes the entry inert rather than hiding files", () => {
+  // The safe direction matters: a hostile or broken entry must never cause a
+  // file to be skipped. It loses its allowlisting power instead.
+  const allowlist = parseAllowlist(`${CATASTROPHIC_PATTERN}\nconfig.txt`);
+  const read = () => "DB_PASS=psspl@443e";
+
+  const scanned = scanStaged({ ...opts, allowlist, files: ["aaaa.txt"], read });
+  assert.ok(scanned.findings.length > 0, "a path the risky pattern would have matched must still be scanned");
+
+  // The valid entry alongside it keeps working.
+  const skipped = scanStaged({ ...opts, allowlist, files: ["config.txt"], read });
+  assert.equal(skipped.findings.length, 0);
 });
 
 test("inline gforge:allow suppresses a line", () => {

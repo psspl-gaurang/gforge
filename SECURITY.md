@@ -2,11 +2,24 @@
 
 ## Supported Versions
 
-GForge is in early development and has no released versions yet.
+GForge is published as `0.x` releases and has not reached 1.0, so there are no
+parallel maintenance lines: fixes go to the next release rather than being
+backported.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| Unreleased `master` | Yes |
+| Version | Supported |
+| ------- | --------- |
+| Latest published release | Yes |
+| Any earlier `0.x` release | No — upgrade with `gforge update` |
+
+Deliberately stated as "latest published release" rather than a pinned number.
+A hardcoded version is what made this section wrong in the first place, and it
+would go stale again on the next publish.
+
+Most installations upgrade themselves: auto-update is on by default, so in
+practice a workstation reaches the latest release without anyone doing anything.
+It can be disabled with `GFORGE_AUTO_UPDATE=0`, in which case upgrading is
+manual. `gforge verify` flags an installed hook engine that has fallen out of
+step with the installed package.
 
 ## Reporting a Vulnerability
 

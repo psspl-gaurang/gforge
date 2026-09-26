@@ -3,6 +3,7 @@ import { detectEnvironment } from "./environment.js";
 import {
   formatInstallResult,
   installManagedHooks,
+  validateInstallPreflight,
   uninstallManagedHooks,
   updateManagedHooks,
   verifyManagedHooks
@@ -14,6 +15,7 @@ import {
   readCachedUpdateNotice
 } from "./npm-update.js";
 import { describeDotenvSources } from "./scanner.js";
+import { runSettingsCommand } from "./settings.js";
 import { createVerificationReport, formatVerificationReport } from "./verify.js";
 
 export async function runCli(args, streams, options = {}) {
@@ -35,6 +37,10 @@ export async function runCli(args, streams, options = {}) {
 
   if (command === "uninstall") {
     return runMutation("uninstall", options.uninstallManagedHooks ?? uninstallManagedHooks, options, streams);
+  }
+
+  if (command === "settings") {
+    return (options.runSettingsCommand ?? runSettingsCommand)(args, streams, options);
   }
 
   if (command === "verify") {
@@ -62,6 +68,24 @@ export async function runCli(args, streams, options = {}) {
 async function runInstallOrUpdate(command, args, options, streams) {
   const force = args.includes("--force") || args.includes("-f");
   const selfUpdateDisabled = Boolean(process.env.GFORGE_NO_SELF_UPDATE) || options.skipSelfUpdate;
+
+  // Validate the environment before touching the network. The self-upgrade
+  // check is a registry round-trip that can take seconds, and on a machine
+  // without git - or on an unsupported platform - the command was going to fail
+  // regardless, so paying for that round-trip first is pure latency before an
+  // error the environment already determined (issue #32).
+  //
+  // The detected environment is then reused by the install itself rather than
+  // being detected twice.
+  const environment = options.environment ?? (await (options.detectEnvironment ?? detectEnvironment)(options));
+  const preflight = validateInstallPreflight(environment);
+  if (preflight.length > 0) {
+    streams.stderr.write(
+      formatInstallResult({ ok: false, command, exitCode: 1, hooksDirectory: null, messages: preflight })
+    );
+    return { exitCode: 1 };
+  }
+  const options_ = { ...options, environment };
 
   if (!selfUpdateDisabled) {
     const latest = await (options.getLatestVersion ?? getLatestVersion)(options);
@@ -102,7 +126,7 @@ async function runInstallOrUpdate(command, args, options, streams) {
   const operation = command === "install"
     ? (options.installManagedHooks ?? installManagedHooks)
     : (options.updateManagedHooks ?? updateManagedHooks);
-  return runMutation(command, operation, options, streams);
+  return runMutation(command, operation, options_, streams);
 }
 
 // Runs a state-mutating command, turning any unexpected failure (permission
@@ -181,11 +205,12 @@ function helpText(stream) {
     row("verify", "Verify the environment and installed hooks (read-only)"),
     row("update", "Upgrade to the latest version (if any) and refresh the hooks"),
     row("uninstall", "Remove GForge-owned hooks and restore your Git config"),
+    row("settings", "Show settings; --no-autoupdate / --autoupdate (minor+major)"),
     row("version", "Display the version"),
     row("help", "Display this help"),
     "",
     header("Environment:"),
-    row("GFORGE_AUTO_UPDATE=0", "Disable automatic background upgrades (on by default)", 30),
+    row("GFORGE_AUTO_UPDATE=0", "Disable minor/major auto-update (overrides settings)", 30),
     row("GFORGE_NO_SELF_UPDATE=1", "Skip the npm self-upgrade in install / update", 30),
     row("GFORGE_SKIP_POSTINSTALL=1", "Skip auto-setup during npm install", 30),
     row("GFORGE_NO_DEFAULT_EXCLUDES=1", "Scan translations, docs and build output too", 30),

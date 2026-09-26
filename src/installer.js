@@ -353,7 +353,10 @@ export function formatInstallResult(result) {
   return `${[header, "", ...result.messages].join("\n")}\n`;
 }
 
-function validateInstallPreflight(environment) {
+// Exported so the CLI can run it BEFORE any network work: there is no point
+// asking the registry for a new version on a machine that cannot install one
+// (issue #32).
+export function validateInstallPreflight(environment) {
   const messages = [];
 
   if (!environment.platform.supported) {

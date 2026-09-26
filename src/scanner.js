@@ -58,7 +58,7 @@ export function isHeuristicExemptPath(filePath, env = process.env) {
 // rule identifiers.
 
 import { execFileSync, spawn } from "node:child_process";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -176,8 +176,16 @@ function isAsciiLowerOrDigit(ch) {
 // (snake_case, ALL_CAPS, plain) — issue #27. Returns the captured value, or
 // null. Loops past a candidate whose boundary or tail doesn't hold, rather
 // than giving up after the first (leftmost) keyword-shaped substring.
-function matchGenericKeyword(line) {
+// Returns EVERY assigned value on the line, not just the first. Each tail runs
+// to end of line, so on `token: process.env.TOKEN, password: "S3cret!789"` the
+// first candidate's value is the whole remainder - which reads as an env-var
+// reference and is correctly cleared. Stopping there meant the hardcoded
+// password after it was never examined at all, and the same secret split onto
+// its own line was caught. One-line object literals are a common style, so this
+// was a broad gap rather than a corner case (issue #81).
+function matchGenericKeywordValues(line) {
   GENERIC_KEYWORD_CORE_RE.lastIndex = 0;
+  const values = [];
   let found;
   while ((found = GENERIC_KEYWORD_CORE_RE.exec(line))) {
     const start = found.index;
@@ -195,9 +203,9 @@ function matchGenericKeyword(line) {
     const afterKeyword = segment ? rest.slice(segment[0].length) : rest;
 
     const tail = afterKeyword.match(KEYWORD_TAIL_RE);
-    if (tail) return tail[1];
+    if (tail) values.push(tail[1]);
   }
-  return null;
+  return values;
 }
 // Placeholder shapes shared by the generic rule and the .env cross-reference.
 // These two lists had drifted: the dotenv layer knew `your_db_password` was a
@@ -605,6 +613,27 @@ function looksBinary(content) {
 // ---------------------------------------------------------------------------
 const INLINE_ALLOW = /(?:gforge|gitleaks):allow/i;
 
+// Allowlist entries are repo-controlled and compiled into regexes that run
+// against every staged path on every commit. A pattern with nested unbounded
+// quantifiers backtracks catastrophically: `(a+)+$` against a 31-character
+// path did not finish in 12 seconds here, which hangs the commit hook outright
+// (issue #31).
+//
+// A clone of an untrusted repository inherits its .gforgeignore silently, so
+// the trust assumption is worth enforcing rather than documenting alone.
+const ALLOWLIST_MAX_PATTERN_LENGTH = 200;
+// A group that already contains an unbounded quantifier, itself quantified:
+// (a+)+ (a*)* (a+)* (a*)+ (a+){2,} and so on. Conservative on purpose - real
+// allowlist entries look like `test/fixtures/` or `^docs/sample\.md$`, and
+// none of those come close to this shape.
+const NESTED_QUANTIFIER_RE = /\([^)]*[+*][^)]*\)\s*(?:[+*]|\{\d+,\s*\})/;
+
+export function isRiskyAllowlistPattern(line) {
+  const value = String(line ?? "");
+  if (value.length > ALLOWLIST_MAX_PATTERN_LENGTH) return true;
+  return NESTED_QUANTIFIER_RE.test(value);
+}
+
 export function parseAllowlist(text) {
   if (!text) return [];
   return text
@@ -612,12 +641,18 @@ export function parseAllowlist(text) {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
     .map((line) => {
-      try {
-        return new RegExp(line);
-      } catch {
-        // Not a valid regex: treat as a literal path substring.
-        return { test: (value) => value.includes(line) };
+      // Falls through to the literal matcher below, which is the same
+      // treatment an uncompilable regex already got. The entry stops matching
+      // as a pattern, which fails SAFE: the path is scanned rather than
+      // skipped, so a hostile or broken entry can never hide a file.
+      if (!isRiskyAllowlistPattern(line)) {
+        try {
+          return new RegExp(line);
+        } catch {
+          // Not a valid regex: treat as a literal path substring.
+        }
       }
+      return { test: (value) => value.includes(line) };
     });
 }
 
@@ -665,17 +700,22 @@ export function scanText(filePath, content, options = {}) {
     }
 
     if (includeGeneric) {
-      const value = matchGenericKeyword(line);
-      // Everything left of the value: the capture runs to end of line, so the
-      // remainder names the key the value was assigned to.
-      const keyContext = value !== null ? line.slice(0, line.length - value.length) : "";
-      if (value !== null && looksLikeHardcodedSecret(value, { codeFile, keyContext })) {
-        findings.push({
-          file: filePath,
-          line: lineNumber,
-          ruleId: GENERIC_SECRET_RULE_ID,
-          description: GENERIC_SECRET_DESCRIPTION
-        });
+      // Still at most one finding per line - the report is per line, and a
+      // second one would just be noise - but every candidate on the line is
+      // now examined before concluding there is nothing there (issue #81).
+      for (const value of matchGenericKeywordValues(line)) {
+        // Everything left of the value: the capture runs to end of line, so the
+        // remainder names the key the value was assigned to.
+        const keyContext = line.slice(0, line.length - value.length);
+        if (looksLikeHardcodedSecret(value, { codeFile, keyContext })) {
+          findings.push({
+            file: filePath,
+            line: lineNumber,
+            ruleId: GENERIC_SECRET_RULE_ID,
+            description: GENERIC_SECRET_DESCRIPTION
+          });
+          break;
+        }
       }
     }
 
@@ -706,9 +746,20 @@ function git(args, options = {}) {
   });
 }
 
+export const STAGED_DIFF_FILTER = "ACMRT";
+
 function stagedFiles() {
   // -z emits raw NUL-delimited paths (no quoting/escaping), so no core.quotePath needed.
-  const out = git(["diff", "--cached", "-z", "--name-only", "--diff-filter=ACMR"]);
+  //
+  // T (type-changed) matters as much as the rest: replacing a tracked symlink
+  // with a regular file leaves the new content fully staged, but git reports it
+  // as T, so leaving T out of the filter made that file invisible to every rule
+  // - a complete bypass of the scanner, not a weakened one (issue #80).
+  //
+  // D is still excluded because a deletion stages no content to scan, and U
+  // (unmerged) because git refuses to commit a conflicted path in the first
+  // place, so the hook never has to judge one.
+  const out = git(["diff", "--cached", "-z", "--name-only", `--diff-filter=${STAGED_DIFF_FILTER}`]);
   return out.toString("utf8").split("\0").filter(Boolean);
 }
 
@@ -1100,18 +1151,260 @@ export function runPreCommit(write = (s) => process.stderr.write(s)) {
 }
 
 // ---------------------------------------------------------------------------
-// Update notification (never blocks or delays the commit).
+// Update notification and tiered auto-update (never blocks or delays a commit).
 //
 // The commit path only READS a cache written by a detached background check, so
-// no network happens on the critical path. Once/day the hook fire-and-forgets a
-// background refresh of that cache; with GFORGE_AUTO_UPDATE=1 the background
-// process also upgrades the package.
+// no network happens on the critical path. Once a day the hook fire-and-forgets
+// a background refresh of that cache, and that background process is also what
+// installs an update.
+//
+// Auto-update is ON by default, because a stale scanner is its own security
+// problem - this project ships detection fixes continuously. The blast radius of
+// a compromised publish is bounded by a quarantine window instead, per tier
+// (issue #29):
+//
+//   patch  48h,     always on - this is where security fixes to GForge ship
+//   minor  7 days,  user-disableable
+//   major  30 days AND tagged `lts`, user-disableable
+//
+// Semver is a claim made by the *publisher*, and in this threat model the
+// publisher is the compromised party - a hostile release would be published as a
+// patch, precisely because that tier moves fastest. So the patch tier gets a
+// real (if short) window rather than zero: long enough for a bad release to be
+// noticed and yanked, short enough that a genuine fix still lands the same week.
 // ---------------------------------------------------------------------------
 const UPDATE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const REGISTRY_URL = "https://registry.npmjs.org/gforge/latest";
+// The full packument, not /gforge/latest: only this response carries the `time`
+// map of publish timestamps that quarantine needs, and the `dist-tags` the LTS
+// rule needs. Measured at ~33KB vs ~1KB, fetched at most once a day off the
+// commit path, so the extra bytes buy both signals for free.
+const DEFAULT_REGISTRY = "https://registry.npmjs.org/";
+
+// Quarantine decides whether a version is old enough to trust, from metadata
+// read over HTTP. The install then runs through npm, which resolves whatever
+// registry npm itself is configured for - a corporate mirror, an .npmrc
+// override. Those can be different registries publishing the same name and
+// version, so the artifact installed need not be the one whose age was checked
+// (issue #79).
+//
+// Resolving npm's registry once and using it for BOTH ends closes that by
+// construction, and respects a deliberate mirror rather than overriding it.
+// Only http(s) is accepted, because the value reaches a fetch().
+
+// Scheme is not the whole check. The URL parser leaves shell syntax untouched:
+// `https://registry.npmjs.org/&ver&` comes back from `npm config get registry`
+// unchanged, parses as an ordinary https URL, and `&` is a command separator.
+// The registry no longer reaches npm's argv at all - it is passed through the
+// environment instead - so this is the second lock rather than the first, but
+// the protocol test was never the guarantee it read as. A registry URL has no
+// legitimate use for any of these characters.
+const SHELL_METACHARACTERS_RE = /[\s&|;<>()$`\\"'!^%]/;
+
+export function normalizeRegistryUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+  const href = parsed.href.endsWith("/") ? parsed.href : `${parsed.href}/`;
+  if (SHELL_METACHARACTERS_RE.test(href)) return null;
+  return href;
+}
+
+export function packumentUrl(registry) {
+  return `${normalizeRegistryUrl(registry) ?? DEFAULT_REGISTRY}gforge`;
+}
+
+// npm's own configured registry, or the public default when npm cannot be
+// asked. Never throws: this runs in the detached background worker.
+function resolveNpmRegistry() {
+  try {
+    const out = execFileSync("npm", ["config", "get", "registry"], {
+      cwd: homedir(),
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 8000
+    });
+    return normalizeRegistryUrl(out.toString("utf8")) ?? DEFAULT_REGISTRY;
+  } catch {
+    return DEFAULT_REGISTRY;
+  }
+}
+
+export const QUARANTINE_MS = {
+  patch: 48 * 60 * 60 * 1000,
+  minor: 7 * 24 * 60 * 60 * 1000,
+  major: 30 * 24 * 60 * 60 * 1000
+};
 
 function updateCachePath() {
   return join(homedir(), ".gforge", "update-check.json");
+}
+
+function updateLogPath() {
+  return join(homedir(), ".gforge", "update-log");
+}
+
+// The engine the hook will actually run next time. Path is spelled out rather
+// than imported: this file is copied standalone into ~/.gforge/hooks and may
+// only use Node built-ins.
+function installedEnginePath() {
+  return join(homedir(), ".gforge", "hooks", "gforge-scan.mjs");
+}
+
+// The version baked into an engine file at install time. getScannerContent()
+// substitutes the placeholder, so the installed copy carries a literal.
+export function parseEngineVersion(content) {
+  const match = /const RUNNING_VERSION = "([^"]+)"/.exec(String(content ?? ""));
+  const version = match ? match[1] : null;
+  // An un-substituted placeholder means a source checkout, not an install.
+  return version && version[0] !== "_" ? version : null;
+}
+
+// Was the update real? npm exiting 0 only says the package landed; the engine
+// version on disk says whether the hook the next commit runs was refreshed.
+export function describeUpdateOutcome({ code, onDisk, version }) {
+  if (code !== 0) return { refreshed: false, outcome: `failed(exit=${code})` };
+  if (onDisk === version) return { refreshed: true, outcome: "installed" };
+  return { refreshed: false, outcome: `installed-but-hooks-stale(onDisk=${onDisk ?? "unknown"})` };
+}
+
+function readInstalledEngineVersion() {
+  try {
+    return parseEngineVersion(readFileSync(installedEnginePath(), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function updateLockPath() {
+  return join(homedir(), ".gforge", "update.lock");
+}
+
+// Long enough that a genuinely slow `npm install -g` is never mistaken for a
+// dead worker, short enough that a crashed one does not block updates for good.
+// The check runs at most once a day anyway, so erring long costs nothing.
+export const UPDATE_LOCK_STALE_MS = 15 * 60 * 1000;
+
+// Two commits in quick succession both see the cache as stale - the first
+// worker has not written it yet - so both spawn a worker and both reach
+// `npm install -g`, two processes writing the same global package directory at
+// once (issue #84). Reproduced at 2/2 concurrent runs before this lock.
+//
+// Every arbitration point here is atomic, because a lock that races is worse
+// than no lock (it would look correct while still double-installing):
+//
+//   - Taking a free lock is an exclusive create ("wx"), which fails EEXIST for
+//     everyone but the winner.
+//   - Stealing a STALE lock is a rename, which fails ENOENT for everyone but
+//     the winner - an unlink-then-create would let two stealers both proceed,
+//     because the second unlink would delete the first one's fresh lock.
+export function acquireUpdateLock(options = {}) {
+  const path = options.path ?? updateLockPath();
+  const now = options.now ?? Date.now();
+  const staleMs = options.staleMs ?? UPDATE_LOCK_STALE_MS;
+  const claim = () => {
+    try {
+      writeFileSync(path, `${JSON.stringify({ pid: process.pid, startedAt: now })}\n`, { flag: "wx" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (claim()) return true;
+
+  // Somebody holds it. Leave a live worker alone.
+  const readStartedAt = (file) => {
+    try {
+      const held = JSON.parse(readFileSync(file, "utf8"));
+      return Number.isFinite(held?.startedAt) ? held.startedAt : null;
+    } catch {
+      return null; // unreadable or corrupt: treat as abandoned
+    }
+  };
+  const heldSince = readStartedAt(path);
+  if (heldSince !== null && now - heldSince < staleMs) return false;
+
+  // Stale, so try to take it over. Renaming alone is NOT a sufficient arbiter
+  // here: if another process has already stolen this lock and claimed a fresh
+  // one, our rename would silently carry off *its live lock* instead of the
+  // dead one, and both of us would install. Observed at 1-in-3 under six
+  // concurrent workers before this check existed.
+  //
+  // So verify that what we actually took is the lock we judged stale, and put
+  // it back if it is not. Worst case is then a skipped check that retries on
+  // the next commit - never a second installer.
+  const stolen = `${path}.stale.${process.pid}`;
+  try {
+    renameSync(path, stolen);
+  } catch {
+    return false;
+  }
+  if (readStartedAt(stolen) !== heldSince) {
+    try {
+      renameSync(stolen, path);
+    } catch {
+      try {
+        unlinkSync(stolen);
+      } catch {
+        // ignore
+      }
+    }
+    return false;
+  }
+  try {
+    unlinkSync(stolen);
+  } catch {
+    // ignore - the steal already succeeded
+  }
+  return claim();
+}
+
+export function releaseUpdateLock(path = updateLockPath()) {
+  try {
+    unlinkSync(path);
+  } catch {
+    // ignore
+  }
+}
+
+export function updateCacheIsStale(now = Date.now(), path = updateCachePath()) {
+  try {
+    const cache = JSON.parse(readFileSync(path, "utf8"));
+    return now - (cache?.checkedAt || 0) > UPDATE_CACHE_TTL_MS;
+  } catch {
+    return true; // no cache yet, or unreadable: a check is due
+  }
+}
+
+// Whether a worker is currently running, used only to skip a pointless spawn.
+// Never throws: this is consulted on the commit path.
+function updateWorkerIsRunning(now = Date.now()) {
+  try {
+    const held = JSON.parse(readFileSync(updateLockPath(), "utf8"));
+    return Number.isFinite(held?.startedAt) && now - held.startedAt < UPDATE_LOCK_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+export function settingsPath(home = homedir()) {
+  // Deliberately NOT state.json: installManagedHooks rewrites that on every
+  // update, so a preference stored there would be wiped by the very auto-update
+  // it governs (issue #29).
+  return join(home, ".gforge", "settings.json");
+}
+
+// Plain release versions only. A prerelease or build-tagged version is never an
+// auto-update target - those are opt-in by definition.
+export function parseVersion(value) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(value ?? "").trim());
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
 }
 
 function versionIsNewer(latest, current) {
@@ -1124,9 +1417,164 @@ function versionIsNewer(latest, current) {
   return false;
 }
 
-// Reads the cached latest version, prints a one-line notice if newer, and once a
-// day fire-and-forgets a background refresh. Fully best-effort — any failure is
-// swallowed so it can never affect the commit.
+// Which tier an upgrade falls into, by the literal semver field that moved.
+// Returns null when `to` is not a plain-release upgrade of `from`.
+//
+// Note the pre-1.0 consequence: at 0.x a semantically breaking 0.3.x -> 0.4.0
+// reads as a minor, so it sits in the 7-day tier rather than the 30-day one.
+// That resolves itself at 1.0.
+export function classifyVersionBump(from, to) {
+  const a = parseVersion(from);
+  const b = parseVersion(to);
+  if (!a || !b) return null;
+  if (!(b[0] > a[0] || (b[0] === a[0] && (b[1] > a[1] || (b[1] === a[1] && b[2] > a[2]))))) return null;
+  if (b[0] !== a[0]) return "major";
+  if (b[1] !== a[1]) return "minor";
+  return "patch";
+}
+
+const AFFIRMATIVE = new Set(["1", "true", "on", "yes"]);
+
+// Resolves whether the minor and major tiers are enabled. Patch is not
+// representable here on purpose: it is always on.
+//
+// The env var is treated as OFF unless it is explicitly affirmative. It used to
+// be the reverse - only 0/false/off/no disabled it - which meant
+// GFORGE_AUTO_UPDATE=disabled, =never or =2 all silently kept auto-installing
+// (issue #29). Anything that is not clearly "yes" now means no.
+export function resolveAutoUpdateSettings({ fileContent = null, env = {} } = {}) {
+  const raw = env.GFORGE_AUTO_UPDATE;
+  if (raw !== undefined && String(raw).trim() !== "") {
+    const on = AFFIRMATIVE.has(String(raw).trim().toLowerCase());
+    return { minor: on, major: on, source: "env" };
+  }
+
+  let parsed = null;
+  try {
+    parsed = fileContent ? JSON.parse(fileContent) : null;
+  } catch {
+    parsed = null; // unreadable settings fall back to the defaults
+  }
+  const autoUpdate = parsed && typeof parsed.autoUpdate === "object" ? parsed.autoUpdate : {};
+  return {
+    minor: autoUpdate.minor !== false,
+    major: autoUpdate.major !== false,
+    source: parsed ? "settings" : "default"
+  };
+}
+
+// How long a published version has been public, clamped at zero so a machine
+// with a clock set behind the registry reports no age rather than a negative
+// one.
+//
+// The clamp is not a defence against a clock set *forward*: it can only raise a
+// value, so a machine 30 days fast sees a version published an hour ago as 30
+// days old and clears every window, including the major one at 31. That is
+// accepted rather than fixed - anyone who can set the system clock can also
+// edit ~/.gforge/settings.json - but it is not a guarantee this offers.
+export function versionAgeMs(publishedAt, now) {
+  const published = Date.parse(String(publishedAt ?? ""));
+  if (!Number.isFinite(published)) return null;
+  return Math.max(0, now - published);
+}
+
+// Picks the version to install, or null when nothing is eligible yet.
+//
+// Within the current major it walks candidates newest-first and takes the first
+// one whose tier is enabled AND whose quarantine has elapsed - so a brand new
+// patch does not stall an older patch that has already matured.
+//
+// Crossing a major happens only via the `lts` dist-tag, and only after the
+// 30-day window. Without an `lts` tag no major ever auto-installs, which is
+// fail-safe but does make publishing that tag a release-process obligation.
+export function selectAutoUpdateTarget({ current, versions = [], distTags = {}, time = {}, now, settings }) {
+  const from = parseVersion(current);
+  if (!from) return null;
+
+  const eligible = (version) => {
+    const tier = classifyVersionBump(current, version);
+    if (!tier) return null;
+    if (tier !== "patch" && !settings[tier]) return null;
+    const age = versionAgeMs(time[version], now);
+    if (age === null || age < QUARANTINE_MS[tier]) return null;
+    return tier;
+  };
+
+  // Same-major candidates: patch and minor tiers.
+  const sameMajor = versions
+    .filter((v) => {
+      const parsed = parseVersion(v);
+      return parsed && parsed[0] === from[0];
+    })
+    .sort((a, b) => (versionIsNewer(a, b) ? -1 : 1));
+
+  let best = null;
+  for (const version of sameMajor) {
+    const tier = eligible(version);
+    if (tier) {
+      best = { version, tier };
+      break;
+    }
+  }
+
+  // A blessed major supersedes, since it is by definition the newer line.
+  const lts = distTags.lts;
+  if (lts && parseVersion(lts) && parseVersion(lts)[0] > from[0]) {
+    const tier = eligible(lts);
+    if (tier === "major") best = { version: lts, tier };
+  }
+
+  return best;
+}
+
+// What the commit path should say about a major it is NOT going to install
+// itself. A notice appears either way so a new major is never invisible; only
+// the emphasis differs, and it must not rely on colour alone (NO_COLOR, CI and
+// pipes all have to carry the distinction) - hence different wording too.
+export function describeMajorNotice({ current, distTags = {}, versions = [], settings }) {
+  const from = parseVersion(current);
+  if (!from) return null;
+
+  const newestMajor = versions
+    .filter((v) => {
+      const parsed = parseVersion(v);
+      return parsed && parsed[0] > from[0];
+    })
+    .sort((a, b) => (versionIsNewer(a, b) ? -1 : 1))[0];
+  if (!newestMajor) return null;
+
+  const lts = distTags.lts;
+  const ltsParsed = lts ? parseVersion(lts) : null;
+  const isLts = Boolean(ltsParsed && ltsParsed[0] > from[0]);
+  const version = isLts ? lts : newestMajor;
+  const willAutoInstall = isLts && settings.major;
+
+  return {
+    version,
+    isLts,
+    highlight: isLts,
+    text: isLts
+      ? `!! gforge v${version} is a new LTS major (you have v${current}).` +
+        (willAutoInstall
+          ? " It installs automatically once it has been published 30 days; run `gforge update` to take it now."
+          : " Auto-update is off for majors, so run `gforge update` to take it.")
+      : `gforge v${version} is a new major (you have v${current}). It is not marked LTS, so it will not install automatically. Run \`gforge update\` to take it.`
+  };
+}
+
+function readSettingsFile() {
+  try {
+    return readFileSync(settingsPath(), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// Reads the cache written by the background check and prints what the developer
+// needs to know: a major that will not install itself, and any unattended
+// install that has already happened. Then, once a day, fire-and-forgets a
+// refresh. Fully best-effort - any failure is swallowed so it can never affect
+// the commit.
 function maybeUpdateNotice(write) {
   try {
     let cache = null;
@@ -1135,13 +1583,58 @@ function maybeUpdateNotice(write) {
     } catch {
       cache = null;
     }
+    const known = RUNNING_VERSION[0] !== "_";
 
-    if (cache && cache.latest && RUNNING_VERSION[0] !== "_" && versionIsNewer(cache.latest, RUNNING_VERSION)) {
-      write(`\ngforge: v${cache.latest} is available (you have v${RUNNING_VERSION}). Run: gforge update\n`);
+    // An unattended install already ran. Announce it once - a mandatory update
+    // channel that leaves no trace is not acceptable for a security tool.
+    if (known && cache?.installed && cache.installed.to === RUNNING_VERSION && !cache.installed.announced) {
+      write(`\ngforge: auto-updated v${cache.installed.from} -> v${cache.installed.to}.\n`);
+      try {
+        cache.installed.announced = true;
+        writeFileSync(updateCachePath(), `${JSON.stringify(cache)}\n`);
+      } catch {
+        // At worst the notice repeats; never worth failing a commit over.
+      }
     }
 
-    const stale = !cache || (Date.now() - (cache.checkedAt || 0)) > UPDATE_CACHE_TTL_MS;
-    if (stale) {
+    // The package updated but the hook files did not, so the engine running
+    // this very commit is still the old one. verify would catch it, but nobody
+    // runs verify on a schedule - and staying quiet about it is precisely what
+    // made this silent (issue #83).
+    if (known && cache?.hooksStale) {
+      const c = makePalette(colorEnabled(process.stderr));
+      write(
+        `\n${c.redBold(
+          `gforge: updated to v${cache.hooksStale.expected} but the managed hook is still v${
+            cache.hooksStale.onDisk ?? "unknown"
+          } - scanning is running old rules. Run \`gforge update\` to refresh it.`
+        )}\n`
+      );
+    }
+
+    if (known && cache) {
+      const settings = resolveAutoUpdateSettings({ fileContent: readSettingsFile(), env: process.env });
+      const major = describeMajorNotice({
+        current: RUNNING_VERSION,
+        distTags: cache.distTags ?? {},
+        versions: cache.versions ?? [],
+        settings
+      });
+      if (major) {
+        const c = makePalette(colorEnabled(process.stderr));
+        write(`\n${major.highlight ? c.redBold(major.text) : major.text}\n`);
+      } else if (cache.latest && versionIsNewer(cache.latest, RUNNING_VERSION)) {
+        // Same-major update pending (still inside its quarantine window, or the
+        // tier is switched off).
+        write(`\ngforge: v${cache.latest} is available (you have v${RUNNING_VERSION}). Run: gforge update\n`);
+      }
+    }
+
+    const stale = updateCacheIsStale();
+    // The worker takes the real lock; this only avoids spawning a process that
+    // would immediately exit. Without it, every commit made during a slow
+    // `npm install -g` would fork a doomed worker (issue #84).
+    if (stale && !updateWorkerIsRunning()) {
       const self = fileURLToPath(import.meta.url);
       const child = spawn(process.execPath, [self, "__update-check"], {
         detached: true,
@@ -1154,56 +1647,164 @@ function maybeUpdateNotice(write) {
   }
 }
 
-// Background worker: refresh the cache and (opt-in) auto-upgrade. Detached from
-// the commit, so it may take its time.
+function appendUpdateLog(line) {
+  try {
+    // Capped by rewriting the tail: this file is advisory, so bounding it
+    // matters more than preserving every historical entry.
+    let previous = "";
+    try {
+      previous = readFileSync(updateLogPath(), "utf8");
+    } catch {
+      previous = "";
+    }
+    const kept = `${previous}${line}\n`.split("\n").slice(-200).join("\n");
+    writeFileSync(updateLogPath(), kept);
+  } catch {
+    // ignore
+  }
+}
+
+// Background worker: refresh the cache and install whatever tier is eligible.
+// Detached from the commit, so it may take its time.
 async function runUpdateCheck() {
-  const cachePath = updateCachePath();
-  let latest = null;
+  // Held for the whole run, not just the install: two workers fetching and
+  // both rewriting the cache is wasted work, and the read-modify-write in
+  // appendUpdateLog loses entries when it races (observed: two installs, one
+  // log line). Losing the lock means another worker is already on it, so there
+  // is nothing useful left to do (issue #84).
+  if (!acquireUpdateLock()) return;
+  try {
+    // Double-checked: mutual exclusion alone is not enough. A worker that
+    // starts late - process startup is slow relative to the race - can acquire
+    // the lock cleanly *after* the winner has already finished and released it,
+    // then repeat the whole install. It still carries the old RUNNING_VERSION
+    // baked into its own engine file, so it cannot tell the work is done. The
+    // freshly written cache is what tells it. Observed 1-in-12 with six
+    // concurrent workers when this recheck was missing.
+    if (!updateCacheIsStale()) return;
+    await runUpdateCheckLocked();
+  } finally {
+    releaseUpdateLock();
+  }
+}
+
+async function runUpdateCheckLocked() {
+  // Resolved once, then used for both the metadata fetch and the install, so
+  // the two can never disagree about where the package came from (issue #79).
+  const registry = resolveNpmRegistry();
+  let packument = null;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
+    const timer = setTimeout(() => controller.abort(), 10000);
     try {
-      const response = await fetch(REGISTRY_URL, { signal: controller.signal });
-      if (response.ok) {
-        const body = await response.json();
-        if (body && /^\d+\.\d+\.\d+/.test(String(body.version || ""))) latest = body.version;
-      }
+      const response = await fetch(packumentUrl(registry), { signal: controller.signal });
+      if (response.ok) packument = await response.json();
     } finally {
       clearTimeout(timer);
     }
   } catch {
-    latest = null;
+    packument = null;
   }
+
+  const distTags = packument?.["dist-tags"] ?? {};
+  const time = packument?.time ?? {};
+  const versions = Object.keys(packument?.versions ?? {}).filter((v) => parseVersion(v));
+  const latest = parseVersion(distTags.latest) ? distTags.latest : null;
 
   try {
     // Always stamp checkedAt so a failed check still waits a day before retrying.
-    writeFileSync(cachePath, `${JSON.stringify({ checkedAt: Date.now(), latest: latest ?? null })}\n`);
+    writeFileSync(
+      updateCachePath(),
+      `${JSON.stringify({ checkedAt: Date.now(), latest, distTags, versions })}\n`
+    );
   } catch {
     // ignore
   }
 
-  // Auto-install is ON by default; opt out with GFORGE_AUTO_UPDATE=0/false/off/no.
-  const optOut = ["0", "false", "off", "no"].includes(String(process.env.GFORGE_AUTO_UPDATE || "").toLowerCase());
-  const safeVersion = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(String(latest || ""));
-  if (latest && safeVersion && !optOut && RUNNING_VERSION[0] !== "_" && versionIsNewer(latest, RUNNING_VERSION)) {
-    try {
-      // Install target is the constant gforge@latest (== the version we just
-      // detected); nothing registry-derived is interpolated into the command.
-      const npm = spawn("npm", ["install", "-g", "gforge@latest"], {
-        // Run from the user's home directory, never the repository being
-        // committed to. With shell:true on Windows, cmd.exe resolves an
-        // unqualified command against the CURRENT DIRECTORY before PATH, so a
-        // repo carrying its own npm.cmd - untracked is enough - would have that
-        // file executed by an unattended background process that an ordinary
-        // commit triggered (issue #78).
-        cwd: homedir(),
-        stdio: "ignore",
-        shell: process.platform === "win32"
-      });
-      await new Promise((resolve) => npm.on("close", resolve).on("error", resolve));
-    } catch {
-      // ignore; the notice will still prompt a manual `gforge update`.
+  if (RUNNING_VERSION[0] === "_" || !packument) return;
+
+  const settings = resolveAutoUpdateSettings({ fileContent: readSettingsFile(), env: process.env });
+  const target = selectAutoUpdateTarget({
+    current: RUNNING_VERSION,
+    versions,
+    distTags,
+    time,
+    now: Date.now(),
+    settings
+  });
+  if (!target) return;
+
+  // The install target is now a specific registry-derived version rather than
+  // the constant gforge@latest: a user on 1.5.2 taking a patch must get 1.5.3,
+  // not `latest`, or a patch would silently carry them across a major boundary
+  // and the whole gate would be meaningless. So this string MUST be validated
+  // before it reaches spawn - hence the hard re-check rather than trusting the
+  // selection above (issue #29).
+  if (!parseVersion(target.version)) return;
+
+  try {
+    // Pinned to the same registry the quarantine metadata came from, so the
+    // artifact installed is the one whose age was actually verified (issue #79)
+    // - but through the environment rather than a --registry= flag. On Windows
+    // npm is npm.cmd and can only be spawned through a shell, and `shell: true`
+    // concatenates argv into a command string without escaping it (Node warns
+    // about exactly this as DEP0190), so a registry value carrying `&` would
+    // run as its own command. npm reads npm_config_* from the environment with
+    // higher precedence than any .npmrc, so the pin still holds and nothing
+    // registry-derived is left for a shell to parse. Everything remaining in
+    // argv is either a literal or a version parseVersion() has just confirmed
+    // is three plain integers.
+    const npm = spawn("npm", ["install", "-g", `gforge@${target.version}`], {
+      // Run from the user's home directory, never the repository being
+      // committed to. With shell:true on Windows, cmd.exe resolves an
+      // unqualified command against the CURRENT DIRECTORY before PATH, so a
+      // repo carrying its own npm.cmd - untracked is enough - would have that
+      // file executed by an unattended background process that an ordinary
+      // commit triggered. This narrows the trust boundary rather than removing
+      // it: an npm.cmd in the home directory is still found, so the guarantee
+      // is "not whichever repository you happen to be committing in", not "the
+      // real npm" (issue #78).
+      cwd: homedir(),
+      stdio: "ignore",
+      shell: process.platform === "win32",
+      env: { ...process.env, npm_config_registry: registry }
+    });
+    const code = await new Promise((resolve) => npm.on("close", resolve).on("error", () => resolve(-1)));
+    const stamp = new Date().toISOString();
+
+    // A zero exit from `npm install -g` is not the same as "the update took
+    // effect". npm can install the package and still never run its postinstall
+    // - ignore-scripts in .npmrc or npm_config_ignore_scripts, or a postinstall
+    // that fails without npm propagating it - and refreshing ~/.gforge/hooks is
+    // exactly what that step does. The engine the next commit actually runs
+    // would then stay on the old version indefinitely while the log and cache
+    // both claimed success (issue #83).
+    //
+    // So confirm against the artifact that matters: the version baked into the
+    // engine file on disk.
+    const onDisk = code === 0 ? readInstalledEngineVersion() : null;
+    const { refreshed, outcome } = describeUpdateOutcome({ code, onDisk, version: target.version });
+    appendUpdateLog(`${stamp} ${outcome} ${target.tier} ${RUNNING_VERSION} -> ${target.version}`);
+
+    if (code === 0) {
+      try {
+        const cache = JSON.parse(readFileSync(updateCachePath(), "utf8"));
+        if (refreshed) {
+          cache.installed = { from: RUNNING_VERSION, to: target.version, at: Date.now(), tier: target.tier };
+          delete cache.hooksStale;
+        } else {
+          // Recorded so the next commit can say so out loud. Claiming success
+          // here is what made this silent in the first place.
+          cache.hooksStale = { expected: target.version, onDisk: onDisk ?? null, at: Date.now() };
+          delete cache.installed;
+        }
+        writeFileSync(updateCachePath(), `${JSON.stringify(cache)}\n`);
+      } catch {
+        // ignore
+      }
     }
+  } catch {
+    appendUpdateLog(`${new Date().toISOString()} error ${target.tier} ${RUNNING_VERSION} -> ${target.version}`);
   }
 }
 
