@@ -126,6 +126,25 @@ export const PROVIDER_RULES = [
   { id: "shopify-token", description: "Shopify access token", regex: /\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}\b/ },
   { id: "square-token", description: "Square access token", regex: /\b(?:sq0atp-[A-Za-z0-9_-]{22}|EAAA[A-Za-z0-9_-]{60})\b/ },
   { id: "telegram-bot-token", description: "Telegram bot token", regex: /\b[0-9]{8,10}:AA[A-Za-z0-9_-]{33}\b/ },
+  // Every rule below anchors on a literal vendor prefix, which is what keeps
+  // this layer high-confidence enough to run everywhere - including inside
+  // docs and build output, where the heuristic layers are deliberately quiet.
+  // Providers whose credentials are a bare hex/base64 run with no prefix
+  // (Cloudflare API tokens, Datadog and Algolia keys, Discord bot tokens) are
+  // left out on purpose: matching them on shape alone would flag every SHA and
+  // random id in the tree, and the generic/entropy layers already cover them
+  // when they appear next to a credential keyword (issue #95).
+  { id: "vault-token", description: "HashiCorp Vault token", regex: /\bhv[sbr]\.[A-Za-z0-9_-]{24,}/ },
+  { id: "atlassian-api-token", description: "Atlassian API token", regex: /\bATATT3[A-Za-z0-9_=-]{20,}/ },
+  { id: "databricks-token", description: "Databricks personal access token", regex: /\bdapi[0-9a-f]{32}(?:-[0-9]+)?\b/ },
+  { id: "postman-api-key", description: "Postman API key", regex: /\bPMAK-[0-9a-f]{24}-[0-9a-f]{34}\b/ },
+  { id: "grafana-token", description: "Grafana service-account/cloud token", regex: /\b(?:glsa_[A-Za-z0-9]{32}_[0-9a-f]{8}|glc_[A-Za-z0-9+/=]{32,})/ },
+  { id: "linear-api-key", description: "Linear API key", regex: /\blin_api_[A-Za-z0-9]{40}\b/ },
+  { id: "supabase-service-key", description: "Supabase service key", regex: /\bsbp_[0-9a-f]{40}\b/ },
+  { id: "newrelic-key", description: "New Relic API key", regex: /\bNRAK-[A-Z0-9]{27}\b/ },
+  { id: "sentry-auth-token", description: "Sentry auth token", regex: /\bsntry[us]_[A-Za-z0-9_.-]{32,}/ },
+  { id: "flyio-token", description: "Fly.io API token", regex: /\bfm[12][a-z]?_[A-Za-z0-9+/=_-]{40,}/ },
+  { id: "terraform-cloud-token", description: "Terraform Cloud/Enterprise token", regex: /\b[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_-]{60,}/ },
   { id: "jwt", description: "JSON Web Token", regex: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/ },
   { id: "basic-auth-url", description: "Credentials embedded in URL", regex: /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s:@]{3,}@/i }
 ];
@@ -660,6 +679,73 @@ function isPathAllowlisted(filePath, allowlist) {
   return allowlist.some((matcher) => matcher.test(filePath));
 }
 
+// A Kubernetes Secret's `data:` values carry no recognisable shape of their
+// own - they are base64 of whatever the secret was - so the only thing that
+// makes them secrets is the `kind: Secret` in the SAME document. Two details a
+// running "have I seen kind: Secret yet" flag gets wrong (issue #95):
+//
+//   - `kubectl get secret -o yaml` emits keys alphabetically, so `data:` comes
+//     out ABOVE `kind:`. That output is exactly what gets pasted into a repo by
+//     accident, so the kind has to be resolved before the values are judged.
+//   - A multi-document file holding a Secret and a ConfigMap would otherwise
+//     have the ConfigMap's data flagged too, which is how a rule like this
+//     earns a reputation for noise.
+//
+// `kind:` is matched as a whole line so SealedSecret and ExternalSecret - which
+// hold ciphertext and references, not secrets - are not swept in.
+const YAML_DOC_SEPARATOR_RE = /^---\s*$/;
+const K8S_SECRET_KIND_RE = /^\s*kind:\s*["']?Secret["']?\s*$/;
+const K8S_DATA_BLOCK_RE = /^(\s*)(?:data|stringData):\s*$/;
+// Inside the block every value IS the secret, so the bar is "a literal", not a
+// shape. Placeholders left for Helm/Kustomize to render are references.
+const K8S_DATA_VALUE_RE = /^\s*[A-Za-z0-9._-]+:\s*["']?[A-Za-z0-9+/]{8,}={0,2}["']?\s*$/;
+const K8S_UNRENDERED_RE = /\{\{|\$\{|<|>/;
+
+export function collectK8sSecretDataLines(lines) {
+  const flagged = new Set();
+  let start = 0;
+
+  const scanDocument = (from, to) => {
+    let isSecret = false;
+    for (let i = from; i < to; i += 1) {
+      if (K8S_SECRET_KIND_RE.test(lines[i])) {
+        isSecret = true;
+        break;
+      }
+    }
+    if (!isSecret) return;
+
+    let dataIndent = null;
+    for (let i = from; i < to; i += 1) {
+      const line = lines[i];
+      const opens = line.match(K8S_DATA_BLOCK_RE);
+      if (opens) {
+        dataIndent = opens[1].length;
+        continue;
+      }
+      if (dataIndent === null || !line.trim()) continue;
+
+      const indent = line.length - line.trimStart().length;
+      if (indent <= dataIndent) {
+        dataIndent = null;
+        continue;
+      }
+      // metadata.name is a long lowercase string too, so only values inside the
+      // data block are judged - not every key in the manifest.
+      if (K8S_DATA_VALUE_RE.test(line) && !K8S_UNRENDERED_RE.test(line)) flagged.add(i + 1);
+    }
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!YAML_DOC_SEPARATOR_RE.test(lines[i])) continue;
+    scanDocument(start, i);
+    start = i + 1;
+  }
+  scanDocument(start, lines.length);
+
+  return flagged;
+}
+
 // ---------------------------------------------------------------------------
 // Core text scanner.
 // ---------------------------------------------------------------------------
@@ -677,7 +763,20 @@ export function scanText(filePath, content, options = {}) {
   // from an MD5 on their own. Only treat a 32-hex string as a token when the
   // file also carries Twilio context (an AC…/SK… SID or the word "twilio").
   const twilioContext = /twilio/i.test(content) || /\b(?:AC|SK)[0-9a-fA-F]{32}\b/.test(content);
+  // A GCP service-account key is a JSON *document*, not a token shape: the only
+  // thing that identifies it is the combination of fields, which a per-line
+  // regex cannot see in a pretty-printed file. The embedded PEM already trips
+  // the private-key rule, but "Private key block" does not tell you a whole
+  // Google Cloud identity was committed - and the file is still a credential
+  // when the PEM has been redacted out of it (issue #95).
+  const gcpServiceAccountContext =
+    /"type"\s*:\s*"service_account"/.test(content) && /"private_key(?:_id)?"\s*:/.test(content);
   const lines = content.split(/\r?\n/);
+  // Likewise a Kubernetes Secret: a `data:` value is only a secret because of
+  // the `kind: Secret` in the same document. Resolved per document up front
+  // rather than as a running flag, for two reasons a sequential scan gets
+  // wrong - see collectK8sSecretDataLines.
+  const k8sSecretDataLines = collectK8sSecretDataLines(lines);
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
@@ -688,6 +787,24 @@ export function scanText(filePath, content, options = {}) {
       if (rule.regex.test(line)) {
         findings.push({ file: filePath, line: lineNumber, ruleId: rule.id, description: rule.description });
       }
+    }
+
+    if (gcpServiceAccountContext && /"private_key_id"\s*:\s*"[A-Za-z0-9]{16,}"/.test(line)) {
+      findings.push({
+        file: filePath,
+        line: lineNumber,
+        ruleId: "gcp-service-account-key",
+        description: "GCP service-account key file"
+      });
+    }
+
+    if (k8sSecretDataLines.has(lineNumber)) {
+      findings.push({
+        file: filePath,
+        line: lineNumber,
+        ruleId: "k8s-secret-data",
+        description: "Kubernetes Secret data value"
+      });
     }
 
     if (twilioContext && /(?<![A-Za-z0-9])[0-9a-fA-F]{32}(?![A-Za-z0-9])/.test(line)) {

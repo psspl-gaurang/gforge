@@ -611,6 +611,196 @@ test("issue #31: a rejected pattern makes the entry inert rather than hiding fil
   assert.equal(skipped.findings.length, 0);
 });
 
+// Correctly shaped but obviously synthetic, and assembled at runtime rather
+// than written out: a literal, well-formed token in this file trips GitHub's
+// push protection before the commit can even reach the repository. Building
+// the string keeps the fixture honest about the shape the rule has to match.
+const repeatTo = (alphabet, length) => alphabet.repeat(Math.ceil(length / alphabet.length)).slice(0, length);
+const hex = (length) => repeatTo("0123456789abcdef", length);
+const alnum = (length) => repeatTo("abcdefghij0123456789", length);
+const upper = (length) => repeatTo("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", length);
+
+test("issue #95: prefix-anchored provider rules for the newly covered vendors", () => {
+  const cases = [
+    ["vault-token", `token = "hv${"s"}.${alnum(28)}"`],
+    ["atlassian-api-token", `ATLASSIAN_TOKEN=ATATT${3}${alnum(26)}`],
+    ["databricks-token", `DATABRICKS_TOKEN=dap${"i"}${hex(32)}`],
+    ["postman-api-key", `PMA${"K"}-${hex(24)}-${hex(34)}`],
+    ["grafana-token", `key: gls${"a"}_${alnum(32)}_${hex(8)}`],
+    ["linear-api-key", `LINEAR_API_KEY=lin_ap${"i"}_${alnum(40)}`],
+    ["supabase-service-key", `SUPABASE=sb${"p"}_${hex(40)}`],
+    ["newrelic-key", `NEW_RELIC_API_KEY=NRA${"K"}-${upper(27)}`],
+    ["sentry-auth-token", `SENTRY_AUTH_TOKEN=sntry${"s"}_${alnum(36)}`],
+    ["flyio-token", `FLY_API_TOKEN=fm${2}_${alnum(44)}`],
+    ["terraform-cloud-token", `TF_TOKEN=${alnum(14)}.atlasv${1}.${alnum(64)}`]
+  ];
+
+  for (const [id, line] of cases) {
+    assert.ok(ruleIds("config.env", line).includes(id), `${id} must fire`);
+    // Provider rules are high-confidence, so they run where the heuristic
+    // layers are deliberately quiet - docs, build output, translations.
+    assert.ok(ruleIds("docs/setup.md", line).includes(id), `${id} must fire in docs too`);
+  }
+});
+
+test("issue #95: the new rules stay off near-misses rather than matching on shape", () => {
+  // Each one anchors on a literal vendor prefix. Without that discipline these
+  // would be indistinguishable from an ordinary hex or base64 run.
+  const nearMisses = [
+    "const path = require('path'); // hvs is not a token here",
+    "DATABRICKS_HOST=https://dapi.example.com",
+    "const id = 'NRAK-SHORT';",
+    "linear = 'lin_api_tooshort'",
+    "sbp_notlongenough",
+    "version = 'atlasv1'",
+    "const sha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';"
+  ];
+  const newRuleIds = new Set([
+    "vault-token", "atlassian-api-token", "databricks-token", "postman-api-key",
+    "grafana-token", "linear-api-key", "supabase-service-key", "newrelic-key",
+    "sentry-auth-token", "flyio-token", "terraform-cloud-token"
+  ]);
+
+  for (const line of nearMisses) {
+    const hit = ruleIds("a.ts", line).filter((id) => newRuleIds.has(id));
+    assert.deepEqual(hit, [], `must not fire on: ${line}`);
+  }
+});
+
+test("issue #95: a GCP service-account key is named as one, pretty-printed or minified", () => {
+  // The embedded PEM already trips the private-key rule, but "Private key
+  // block" does not say that a whole Google Cloud identity was committed.
+  const fields = {
+    type: "service_account",
+    project_id: "example",
+    private_key_id: "0123456789abcdef0123456789abcdef01234567",
+    private_key: "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+    client_email: "svc@example.iam.gserviceaccount.com"
+  };
+
+  const pretty = ruleIds("sa.json", JSON.stringify(fields, null, 2));
+  assert.ok(pretty.includes("gcp-service-account-key"));
+  assert.ok(pretty.includes("private-key"), "the PEM rule still fires alongside it");
+
+  // Minified onto one line, which is how these are usually pasted into config.
+  assert.ok(ruleIds("sa.json", JSON.stringify(fields)).includes("gcp-service-account-key"));
+
+  // Still a credential once the PEM has been redacted out of it.
+  const redacted = { ...fields, private_key: "REDACTED" };
+  assert.ok(ruleIds("sa.json", JSON.stringify(redacted, null, 2)).includes("gcp-service-account-key"));
+
+  // A JSON file that merely mentions the words is not one.
+  assert.equal(
+    ruleIds("notes.json", JSON.stringify({ note: "create a service_account and store private_key safely" })).includes(
+      "gcp-service-account-key"
+    ),
+    false
+  );
+  // Nor is a service account with no key material and a placeholder id.
+  assert.equal(
+    ruleIds("sa.json", JSON.stringify({ type: "service_account", private_key_id: "..." }, null, 2)).includes(
+      "gcp-service-account-key"
+    ),
+    false
+  );
+});
+
+test("issue #95: Kubernetes Secret data values are flagged, and only those", () => {
+  const manifest = [
+    "apiVersion: v1",
+    "kind: Secret",
+    "metadata:",
+    "  name: my-very-long-secret-name",
+    "  namespace: production",
+    "type: Opaque",
+    "data:",
+    "  password: cGFzc3dvcmQxMjM0NTY=",
+    "  username: YWRtaW5pc3RyYXRvcg==",
+    "---",
+    "apiVersion: v1",
+    "kind: ConfigMap"
+  ].join("\n");
+
+  const findings = scanText("secret.yaml", manifest, opts).filter((f) => f.ruleId === "k8s-secret-data");
+  // The two data values, and nothing above them: metadata.name is a long
+  // lowercase string too, and flagging it would make every manifest noisy.
+  assert.deepEqual(findings.map((f) => f.line), [8, 9]);
+
+  // stringData holds the plaintext form, which is no less a secret.
+  const stringData = ["kind: Secret", "stringData:", "  password: sup3rsecretvalue"].join("\n");
+  assert.ok(ruleIds("s.yaml", stringData).includes("k8s-secret-data"));
+});
+
+test("issue #95: SealedSecret, templates and non-Secret manifests stay clear", () => {
+  // A SealedSecret holds ciphertext and an ExternalSecret holds a reference;
+  // neither is a secret, so `kind:` is matched as a whole line rather than as
+  // a substring.
+  const sealed = [
+    "apiVersion: bitnami.com/v1alpha1",
+    "kind: SealedSecret",
+    "spec:",
+    "  encryptedData:",
+    "    password: AgBv0Kk3aBcDeFgHiJkLmNoPqRsTuVwXyZ"
+  ].join("\n");
+  assert.equal(ruleIds("sealed.yaml", sealed).includes("k8s-secret-data"), false);
+
+  const external = ["kind: ExternalSecret", "data:", "  password: cGFzc3dvcmQxMjM0NTY="].join("\n");
+  assert.equal(ruleIds("ext.yaml", external).includes("k8s-secret-data"), false);
+
+  // Helm and Kustomize placeholders are references waiting to be rendered.
+  const helm = ["kind: Secret", "data:", "  password: {{ .Values.password | b64enc }}"].join("\n");
+  assert.equal(ruleIds("t.yaml", helm).includes("k8s-secret-data"), false);
+  const env = ["kind: Secret", "data:", "  password: ${DB_PASSWORD}"].join("\n");
+  assert.equal(ruleIds("t.yaml", env).includes("k8s-secret-data"), false);
+
+  // An empty data block is not a leak.
+  assert.equal(ruleIds("s.yaml", ["kind: Secret", "data: {}"].join("\n")).includes("k8s-secret-data"), false);
+
+  // And a ConfigMap is not a Secret, whatever its data looks like.
+  const configMap = ["kind: ConfigMap", "data:", "  greeting: aGVsbG93b3JsZDEyMzQ1"].join("\n");
+  assert.equal(ruleIds("cm.yaml", configMap).includes("k8s-secret-data"), false);
+});
+
+test("issue #95: the Secret kind is resolved per document, not as a running flag", () => {
+  // `kubectl get secret -o yaml` emits keys alphabetically, so `data:` comes
+  // out ABOVE `kind:` - and that output is exactly what gets pasted into a
+  // repo by accident. A sequential "have I seen kind: Secret yet" flag misses
+  // it entirely.
+  const kubectlOutput = [
+    "apiVersion: v1",
+    "data:",
+    "  password: cGFzc3dvcmQxMjM0NTY=",
+    "kind: Secret",
+    "metadata:",
+    "  name: db-credentials",
+    "type: Opaque"
+  ].join("\n");
+  const found = scanText("dump.yaml", kubectlOutput, opts).filter((f) => f.ruleId === "k8s-secret-data");
+  assert.deepEqual(found.map((f) => f.line), [3]);
+
+  // And a multi-document file scopes each kind to its own document, in both
+  // orders - otherwise a ConfigMap sharing the file gets flagged too.
+  const secretThenConfigMap = [
+    "kind: Secret", "data:", "  a: cGFzc3dvcmQxMjM0NTY=",
+    "---",
+    "kind: ConfigMap", "data:", "  b: aGVsbG93b3JsZDEyMzQ1"
+  ].join("\n");
+  assert.deepEqual(
+    scanText("m.yaml", secretThenConfigMap, opts).filter((f) => f.ruleId === "k8s-secret-data").map((f) => f.line),
+    [3]
+  );
+
+  const configMapThenSecret = [
+    "kind: ConfigMap", "data:", "  b: aGVsbG93b3JsZDEyMzQ1",
+    "---",
+    "kind: Secret", "data:", "  a: cGFzc3dvcmQxMjM0NTY="
+  ].join("\n");
+  assert.deepEqual(
+    scanText("m.yaml", configMapThenSecret, opts).filter((f) => f.ruleId === "k8s-secret-data").map((f) => f.line),
+    [7]
+  );
+});
+
 test("inline gforge:allow suppresses a line", () => {
   assert.equal(ruleIds("a", "DB_PASS=psspl@443e # gforge:allow").length, 0);
   assert.equal(ruleIds("a", "DB_PASS=psspl@443e // gitleaks:allow").length, 0);

@@ -139,7 +139,15 @@ value**. Detection runs several layers in order:
    `server/.env` and `client/.env` are covered. Template files are skipped, and
    the search prunes vendored and build directories (`node_modules`, `dist`, …).
    `gforge verify` prints which `.env` files this layer found.
-2. **Provider rules** — fixed credential shapes for the major cloud and SaaS providers.
+2. **Provider rules** — fixed credential shapes for the major cloud and SaaS
+   providers: AWS, GCP (API keys, OAuth secrets and service-account key files),
+   Azure, GitHub, GitLab, Slack, Stripe, Twilio, SendGrid, OpenAI, Anthropic,
+   HashiCorp Vault, Atlassian, Databricks, Grafana, Linear, Supabase, New Relic,
+   Sentry, Fly.io, Terraform Cloud, Postman, private keys, JWTs, and Kubernetes
+   `Secret` manifests. Every rule anchors on a literal vendor prefix or document
+   shape, so providers whose credentials are a bare hex or base64 run with no
+   prefix are deliberately left to layers 3 and 4 rather than matched on length
+   alone.
 3. **Generic secrets** — credential keywords assigned to a hardcoded value; smart
    enough to ignore `process.env.*`, function calls, `${VAR}` interpolation, and
    obvious placeholders.
