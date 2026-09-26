@@ -3,7 +3,6 @@ import test from "node:test";
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
 
 import { compareVersions, getLatestVersion, isNewer, performSelfUpgrade } from "../src/npm-update.js";
 
@@ -127,13 +126,16 @@ test("issue #78: every npm call site in src/ passes a cwd, including the backgro
   // So the invariant is asserted against the source itself, which also covers
   // `npm config get registry` and any call site added later - the previous test
   // could only ever see the three it drives by hand.
-  const sources = ["../src/npm-update.js", "../src/scanner.js"];
+  // Named rather than derived from the URL, so the label in a failure message
+  // needs no string surgery to produce.
+  const sources = [
+    { label: "src/npm-update.js", url: new URL("../src/npm-update.js", import.meta.url) },
+    { label: "src/scanner.js", url: new URL("../src/scanner.js", import.meta.url) }
+  ];
   const callSites = [];
 
-  for (const relative of sources) {
-    const file = fileURLToPath(new URL(relative, import.meta.url));
-    const source = await readFile(file, "utf8");
-    const lines = source.split("\n");
+  for (const { label, url } of sources) {
+    const lines = (await readFile(url, "utf8")).split("\n");
 
     lines.forEach((line, index) => {
       if (!line.includes('("npm", [')) return;
@@ -142,7 +144,7 @@ test("issue #78: every npm call site in src/ passes a cwd, including the backgro
       const end = lines.findIndex((l, i) => i >= index && /^\s*}\s*\)/.test(l));
       const call = lines.slice(index, end === -1 ? index + 1 : end + 1).join("\n");
       callSites.push({
-        where: `${relative.replace("../", "")}:${index + 1}`,
+        where: `${label}:${index + 1}`,
         hasCwd: /\bcwd:\s*(?:homedir\(\)|npmCwd\(\))/.test(call)
       });
     });
