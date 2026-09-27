@@ -1755,6 +1755,16 @@ async function runUpdateCheckLocked() {
     // argv is either a literal or a version parseVersion() has just confirmed
     // is three plain integers.
     const npm = spawn("npm", ["install", "-g", `gforge@${target.version}`], {
+      // Run from the user's home directory, never the repository being
+      // committed to. With shell:true on Windows, cmd.exe resolves an
+      // unqualified command against the CURRENT DIRECTORY before PATH, so a
+      // repo carrying its own npm.cmd - untracked is enough - would have that
+      // file executed by an unattended background process that an ordinary
+      // commit triggered. This narrows the trust boundary rather than removing
+      // it: an npm.cmd in the home directory is still found, so the guarantee
+      // is "not whichever repository you happen to be committing in", not "the
+      // real npm" (issue #78).
+      cwd: homedir(),
       stdio: "ignore",
       shell: process.platform === "win32",
       env: { ...process.env, npm_config_registry: registry }
