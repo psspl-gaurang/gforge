@@ -661,6 +661,122 @@ function isPathAllowlisted(filePath, allowlist) {
 }
 
 // ---------------------------------------------------------------------------
+// Custom rule packs: user-defined provider rules layered ON TOP of the built-in
+// PROVIDER_RULES, so a team can detect an internal credential format without
+// forking the tool (issue #93).
+//
+// The pack lives at ~/.gforge/rules.json, next to settings.json, and NOT in the
+// repository. A repo-level pack would let any clone inject a regex that runs
+// against every line of every staged file, and the failure mode is a commit
+// hook that never returns. The home directory is the user's own; an org
+// distributes the file there with whatever config management it already uses.
+//
+// Layered, never substituted: a pack can only ADD findings. Nothing in it can
+// disable, weaken or shadow a built-in rule, so the worst a broken or hostile
+// pack achieves is noise - which is why every rejection below still leaves the
+// built-in rules running.
+// ---------------------------------------------------------------------------
+const CUSTOM_RULES_MAX = 200;
+const CUSTOM_RULE_ID_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
+const CUSTOM_RULE_DESCRIPTION_MAX = 120;
+// `g` and `y` are rejected rather than stripped: both make `regex.test()`
+// stateful through lastIndex, so a rule carrying one would match on every
+// other line it could match on and silently miss the rest.
+const CUSTOM_RULE_FLAGS_RE = /^[imsu]*$/;
+// Rule ids that already mean something in a report. A pack reusing one would
+// make a finding's origin unreadable, so they are refused rather than renamed.
+const RESERVED_RULE_IDS = new Set([
+  ...PROVIDER_RULES.map((rule) => rule.id),
+  GENERIC_SECRET_RULE_ID,
+  "twilio-auth-token",
+  "high-entropy-string",
+  "hardcoded-dotenv-secret",
+  "secret-file",
+  "secret-file-env"
+]);
+
+export function customRulesPath(home = homedir()) {
+  return join(home, ".gforge", "rules.json");
+}
+
+// Returns { rules, errors }. Every rejection is reported by id or index so a
+// pack that silently stopped working can be found, and the surviving rules are
+// still returned: one bad entry does not discard the rest of the pack.
+export function parseCustomRules(text) {
+  const errors = [];
+  if (!text || !String(text).trim()) return { rules: [], errors };
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { rules: [], errors: [`not valid JSON (${error?.message ?? error})`] };
+  }
+
+  const declared = parsed?.rules;
+  if (!Array.isArray(declared)) {
+    return { rules: [], errors: ['expected an object with a "rules" array'] };
+  }
+  if (declared.length > CUSTOM_RULES_MAX) {
+    return { rules: [], errors: [`too many rules (${declared.length}, limit ${CUSTOM_RULES_MAX})`] };
+  }
+
+  const rules = [];
+  const seen = new Set();
+
+  declared.forEach((entry, index) => {
+    const where = typeof entry?.id === "string" && entry.id ? `"${entry.id}"` : `rule ${index + 1}`;
+    const reject = (reason) => errors.push(`${where}: ${reason}`);
+
+    if (!entry || typeof entry !== "object") return reject("not an object");
+    if (typeof entry.id !== "string" || !CUSTOM_RULE_ID_RE.test(entry.id)) {
+      return reject("id must be 2-40 characters of lowercase letters, digits and hyphens");
+    }
+    if (RESERVED_RULE_IDS.has(entry.id)) return reject("id is already used by a built-in rule");
+    if (seen.has(entry.id)) return reject("duplicate id");
+    if (typeof entry.description !== "string" || !entry.description.trim()) {
+      return reject("description is required");
+    }
+    // Single line and bounded: the description is printed in the report, and a
+    // multi-line one could forge report structure around it.
+    if (entry.description.length > CUSTOM_RULE_DESCRIPTION_MAX || /[\r\n]/.test(entry.description)) {
+      return reject(`description must be one line of at most ${CUSTOM_RULE_DESCRIPTION_MAX} characters`);
+    }
+    if (typeof entry.regex !== "string" || !entry.regex) return reject("regex is required");
+    // Same catastrophic-backtracking guard the allowlist gets, and for a
+    // sharper reason: this pattern runs against every line of every staged
+    // file, so a hang here stops the developer committing at all (issue #31).
+    if (isRiskyAllowlistPattern(entry.regex)) return reject("regex is too long or backtracks catastrophically");
+    const flags = entry.flags ?? "";
+    if (typeof flags !== "string" || !CUSTOM_RULE_FLAGS_RE.test(flags)) {
+      return reject("flags may only be i, m, s or u");
+    }
+
+    let regex;
+    try {
+      regex = new RegExp(entry.regex, flags);
+    } catch (error) {
+      return reject(`regex does not compile (${error?.message ?? error})`);
+    }
+
+    seen.add(entry.id);
+    rules.push({ id: entry.id, description: entry.description.trim(), regex, custom: true });
+  });
+
+  return { rules, errors };
+}
+
+export function loadCustomRules(home = homedir()) {
+  let text;
+  try {
+    text = readFileSync(customRulesPath(home), "utf8");
+  } catch {
+    return { rules: [], errors: [] }; // no pack is the normal case
+  }
+  return parseCustomRules(text);
+}
+
+// ---------------------------------------------------------------------------
 // Core text scanner.
 // ---------------------------------------------------------------------------
 export function scanText(filePath, content, options = {}) {
@@ -672,6 +788,10 @@ export function scanText(filePath, content, options = {}) {
   const skipEntropy = options.entropy === false || Boolean(exemptReason) || looksBinary(content);
 
   const includeGeneric = options.generic !== false && !exemptReason;
+  // Custom rules are high-confidence by construction (a team wrote them for
+  // their own credential format), so they run even where the heuristic layers
+  // are exempt - the same treatment the built-in provider rules get.
+  const customRules = options.customRules ?? [];
   const codeFile = isCodeFile(filePath);
   // Twilio auth tokens are bare 32-hex strings (no prefix), indistinguishable
   // from an MD5 on their own. Only treat a 32-hex string as a token when the
@@ -684,9 +804,24 @@ export function scanText(filePath, content, options = {}) {
     if (INLINE_ALLOW.test(line)) continue;
     const lineNumber = i + 1;
 
+    // Built-ins first, then any user pack. Layered rather than merged at
+    // definition time so a pack can never reorder or shadow a built-in rule
+    // (issue #93).
     for (const rule of PROVIDER_RULES) {
       if (rule.regex.test(line)) {
         findings.push({ file: filePath, line: lineNumber, ruleId: rule.id, description: rule.description });
+      }
+    }
+
+    for (const rule of customRules) {
+      // A custom regex is compiled from a file the tool does not control, so a
+      // throw at match time must not take the commit hook down with it.
+      try {
+        if (rule.regex.test(line)) {
+          findings.push({ file: filePath, line: lineNumber, ruleId: rule.id, description: rule.description });
+        }
+      } catch {
+        // ignore this rule for this line; the built-in rules still ran
       }
     }
 
@@ -1047,6 +1182,9 @@ export function scanStaged(options = {}) {
   const allowlist = options.allowlist ?? loadAllowlist();
   const files = options.files ?? stagedFiles();
   const dotenvSecrets = options.dotenvSecrets ?? loadDotenvSecrets();
+  // Loaded once per commit rather than per file: the pack is small, but
+  // recompiling its regexes for every staged path would be pure waste.
+  const customRulePack = options.customRules ? { rules: options.customRules, errors: [] } : loadCustomRules();
   const findings = [];
 
   for (const file of files) {
@@ -1076,12 +1214,17 @@ export function scanStaged(options = {}) {
 
     // Env templates are meant to hold placeholder values, so skip the generic
     // keyword and entropy rules for them, but still catch a real provider token.
-    const fileOptions = isEnvTemplate(file) ? { ...options, generic: false, entropy: false } : options;
+    const fileOptions = isEnvTemplate(file)
+      ? { ...options, customRules: customRulePack.rules, generic: false, entropy: false }
+      : { ...options, customRules: customRulePack.rules };
     findings.push(...scanText(file, content, fileOptions));
   }
 
   const gitleaks = options.runGitleaks === false ? { available: false, leaks: false } : runGitleaks();
-  return { findings, gitleaks };
+  // Reported so a pack that silently stopped loading is visible. Never fatal:
+  // a rejected rule leaves the built-in rules running, and refusing the commit
+  // over a malformed preference file would be its own outage (issue #93).
+  return { findings, gitleaks, customRules: customRulePack };
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,12 +1285,25 @@ export function formatReport({ findings, gitleaks }, options = {}) {
 
 export function runPreCommit(write = (s) => process.stderr.write(s)) {
   const result = scanStaged();
+  // Printed whether or not the commit is blocked: a custom rule pack that
+  // stopped loading is a detection layer going quiet, which is exactly the
+  // failure the developer would otherwise never notice.
+  const warning = formatCustomRuleErrors(result.customRules?.errors ?? []);
+  if (warning) write(warning);
   const blocked = result.findings.length > 0 || result.gitleaks?.leaks;
   if (blocked) {
     write(formatReport(result, { color: colorEnabled(process.stderr) }));
     return 1;
   }
   return 0;
+}
+
+export function formatCustomRuleErrors(errors, home = homedir()) {
+  if (!errors || errors.length === 0) return "";
+  const lines = [`GForge: ignoring invalid custom rules in ${customRulesPath(home)}`];
+  for (const error of errors) lines.push(`  - ${error}`);
+  lines.push("  The built-in rules are unaffected.");
+  return `${lines.join("\n")}\n`;
 }
 
 // ---------------------------------------------------------------------------
