@@ -20,8 +20,10 @@ import {
   selectAutoUpdateTarget,
   settingsPath,
   updateCacheIsStale,
-  versionAgeMs
+  versionAgeMs,
+  versionIsNewer
 } from "../src/scanner.js";
+import { isNewer } from "../src/npm-update.js";
 import {
   formatAutoUpdateSettings,
   mergeAutoUpdateSettings,
@@ -560,4 +562,44 @@ test("issue #83: the engine's baked version is read from the installed file", ()
   for (const bad of ["", null, undefined, "nothing here", "const RUNNING_VERSION = 0.3.9;"]) {
     assert.equal(parseEngineVersion(bad), null, JSON.stringify(bad));
   }
+});
+
+test("issue #49: the engine's version comparison agrees with the CLI's on every pair", () => {
+  // Two implementations exist because the engine is copied standalone into
+  // ~/.gforge/hooks and cannot import npm-update.js. They must not drift: the
+  // CLI's copy decides what `gforge update` reports, and the engine's copy both
+  // gates the commit-time notice and orders the candidates the unattended
+  // installer picks from.
+  const edgeCases = [
+    ["0.3.10", "0.3.9"], // numeric, not lexical
+    ["0.10.0", "0.9.9"],
+    ["1.0.0", "0.99.99"],
+    ["1.0", "1.0.0"], // missing component reads as 0
+    ["1.0.0", "1.0"],
+    ["1.2.3", "1.2.3"],
+    ["1.2.3-beta.1", "1.2.3"], // prerelease tail is dropped by parseInt
+    ["1.2.3", "1.2.3-beta.1"],
+    ["v1.2.3", "1.2.3"], // unparseable components read as 0
+    ["", "0.0.1"],
+    ["0.0.1", ""],
+    ["abc", "def"]
+  ];
+
+  const corpus = [];
+  for (let major = 0; major <= 2; major += 1) {
+    for (let minor = 0; minor <= 11; minor += 1) {
+      for (let patch = 0; patch <= 11; patch += 1) corpus.push(`${major}.${minor}.${patch}`);
+    }
+  }
+  const pairs = [...edgeCases];
+  for (const a of corpus) for (const b of corpus) pairs.push([a, b]);
+
+  const disagreements = pairs.filter(([a, b]) => versionIsNewer(a, b) !== isNewer(a, b));
+  assert.deepEqual(disagreements, []);
+  assert.ok(pairs.length > 100000, `the corpus must actually be exercised, got ${pairs.length}`);
+
+  // And the answers themselves are the right ones, not merely identical.
+  assert.equal(versionIsNewer("0.3.10", "0.3.9"), true);
+  assert.equal(versionIsNewer("1.2.3", "1.2.3"), false);
+  assert.equal(versionIsNewer("0.3.9", "0.3.10"), false);
 });
