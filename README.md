@@ -147,7 +147,7 @@ value**. Detection runs several layers in order:
    `Secret` manifests. Every rule anchors on a literal vendor prefix or document
    shape, so providers whose credentials are a bare hex or base64 run with no
    prefix are deliberately left to layers 3 and 4 rather than matched on length
-   alone.
+   alone. Add your own formats with [custom rules](#custom-rule-packs).
 3. **Generic secrets** — credential keywords assigned to a hardcoded value; smart
    enough to ignore `process.env.*`, function calls, `${VAR}` interpolation, and
    obvious placeholders.
@@ -180,6 +180,42 @@ Google credential, a private key, a `.env` file, or a value copied out of your
 `.env` is still blocked inside `dist/`, a README, or a translation catalogue —
 only the noisy keyword and entropy heuristics are quietened. Set
 `GFORGE_NO_DEFAULT_EXCLUDES=1` to scan every path with every layer.
+
+### Custom rule packs
+
+Teams with an internal credential format can add their own provider rules without
+forking GForge. Create `~/.gforge/rules.json`:
+
+```json
+{
+  "rules": [
+    {
+      "id": "acme-internal-token",
+      "description": "ACME internal service token",
+      "regex": "\\bacme_[A-Za-z0-9]{32}\\b",
+      "flags": "i"
+    }
+  ]
+}
+```
+
+`id` is lowercase letters, digits and hyphens (2–40 characters) and is what
+appears in the report. `flags` is optional and limited to `i`, `m`, `s` and `u` —
+`g` and `y` are refused because they make matching stateful, which would silently
+skip lines.
+
+Custom rules **layer on top of** the built-in ones: a pack can only add findings.
+It cannot disable, weaken or shadow a built-in rule, and reusing a built-in rule's
+`id` is refused so every finding's origin stays readable.
+
+The pack lives in your home directory rather than in the repository, because a
+repo-level pack would let any clone inject a regex that runs against every line of
+every staged file. The same catastrophic-backtracking limits as the allowlist
+apply. An invalid rule is reported on the next commit and skipped; the built-in
+rules keep running, so a malformed file never disables scanning.
+
+An organization distributes the file with whatever configuration management it
+already uses — GForge never fetches rules over the network.
 
 ## Managing false positives
 
@@ -272,7 +308,9 @@ Behavior is controlled through the environment variables below.
 GForge keeps its own state under `~/.gforge` — the managed hooks, an install
 state file, and an update-check cache. Those are managed for you by
 `install` / `update` / `uninstall` and are not meant to be edited by hand, so
-there is nothing to set up before the table below applies.
+there is nothing to set up before the table below applies. The one file in there
+you may write yourself is `rules.json`, the optional
+[custom rule pack](#custom-rule-packs).
 
 | Variable | Effect |
 | --- | --- |
