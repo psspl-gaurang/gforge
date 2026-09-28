@@ -15,9 +15,12 @@ import {
   isExpectedGitReadFailure,
   isHeuristicExemptPath,
   isEnvTemplate,
+  formatCustomRuleErrors,
+  loadCustomRules,
   describeSharedAllowlist,
   isRiskyAllowlistPattern,
   loadSharedAllowlist,
+  parseCustomRules,
   loadDotenvSecrets,
   matchFilenameRule,
   parseAllowlist,
@@ -611,6 +614,147 @@ test("issue #31: a rejected pattern makes the entry inert rather than hiding fil
   // The valid entry alongside it keeps working.
   const skipped = scanStaged({ ...opts, allowlist, files: ["config.txt"], read });
   assert.equal(skipped.findings.length, 0);
+});
+
+test("issue #93: a custom rule pack detects an internal credential format", () => {
+  const { rules, errors } = parseCustomRules(
+    JSON.stringify({
+      rules: [{ id: "acme-internal-token", description: "ACME internal token", regex: "\\bacme_[A-Za-z0-9]{32}\\b" }]
+    })
+  );
+  assert.deepEqual(errors, []);
+  assert.equal(rules.length, 1);
+
+  const found = ruleIds("svc.ts", 'const t = "acme_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";', { customRules: rules });
+  assert.ok(found.includes("acme-internal-token"));
+
+  // Layered, not substituted: the built-in rules still run alongside it.
+  const both = ruleIds("svc.ts", 'const gh = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";', { customRules: rules });
+  assert.ok(both.includes("github-pat"));
+});
+
+test("issue #93: a custom pack cannot disable, shadow or rename a built-in rule", () => {
+  // The whole layer is additive. The only thing a pack could do to a built-in
+  // rule is make its findings unreadable by reusing its id, so that is refused.
+  const { rules, errors } = parseCustomRules(
+    JSON.stringify({
+      rules: [
+        { id: "github-pat", description: "not the real one", regex: "never-matches-anything" },
+        { id: "generic-secret-assignment", description: "nor this", regex: "also-no" }
+      ]
+    })
+  );
+  assert.equal(rules.length, 0);
+  assert.equal(errors.length, 2);
+  for (const error of errors) assert.match(error, /already used by a built-in rule/);
+
+  // And the built-in rule it tried to take over is untouched.
+  assert.ok(ruleIds("a.ts", 'k = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";', { customRules: rules }).includes("github-pat"));
+});
+
+test("issue #93: a malformed pack is reported and ignored, never fatal", () => {
+  // Fail-safe direction: a preference file that stopped parsing must not take
+  // secret scanning down with it.
+  const broken = parseCustomRules("{ not json");
+  assert.equal(broken.rules.length, 0);
+  assert.match(broken.errors[0], /not valid JSON/);
+
+  assert.match(parseCustomRules('{"rules": "nope"}').errors[0], /"rules" array/);
+  assert.deepEqual(parseCustomRules("").rules, []);
+
+  // One bad entry does not discard the good ones alongside it.
+  const mixed = parseCustomRules(
+    JSON.stringify({
+      rules: [
+        { id: "BadCase", description: "bad id", regex: "x" },
+        { id: "good-rule", description: "good", regex: "\\bzzz_[0-9]{6}\\b" },
+        { id: "no-regex", description: "missing regex" },
+        { id: "bad-regex", description: "does not compile", regex: "([unclosed" },
+        { id: "good-rule", description: "duplicate", regex: "x" }
+      ]
+    })
+  );
+  assert.deepEqual(mixed.rules.map((r) => r.id), ["good-rule"]);
+  assert.equal(mixed.errors.length, 4);
+  assert.ok(ruleIds("a.ts", 'k = "zzz_123456"', { customRules: mixed.rules }).includes("good-rule"));
+
+  // And the warning names the file, so a quiet layer can be found.
+  const warning = formatCustomRuleErrors(mixed.errors, "/home/dev");
+  assert.match(warning, /rules\.json/);
+  assert.match(warning, /built-in rules are unaffected/);
+  assert.equal(formatCustomRuleErrors([]), "");
+});
+
+test("issue #93: a pack cannot hang the commit hook or make matching stateful", () => {
+  // Same catastrophic-backtracking guard the allowlist gets (issue #31), and
+  // for a sharper reason: a custom rule runs against every line of every
+  // staged file, so a hang here stops the developer committing at all.
+  const risky = parseCustomRules(
+    JSON.stringify({ rules: [{ id: "redos", description: "nested quantifier", regex: CATASTROPHIC_PATTERN }] })
+  );
+  assert.equal(risky.rules.length, 0);
+  assert.match(risky.errors[0], /backtracks catastrophically/);
+
+  // `g` and `y` make regex.test() stateful through lastIndex, so a rule
+  // carrying one would match every other line and silently miss the rest.
+  for (const flags of ["g", "y", "gi"]) {
+    const result = parseCustomRules(
+      JSON.stringify({ rules: [{ id: "flagged", description: "stateful", regex: "secret", flags }] })
+    );
+    assert.equal(result.rules.length, 0, `flags "${flags}" must be refused`);
+    assert.match(result.errors[0], /flags may only be/);
+  }
+
+  // The flags that are safe still work.
+  const insensitive = parseCustomRules(
+    JSON.stringify({ rules: [{ id: "ci-rule", description: "case-insensitive", regex: "\\bacme-key\\b", flags: "i" }] })
+  );
+  assert.deepEqual(insensitive.errors, []);
+  assert.ok(ruleIds("a.ts", "ACME-KEY", { customRules: insensitive.rules }).includes("ci-rule"));
+});
+
+test("issue #93: a custom rule that throws at match time does not take the scan down", () => {
+  // The regexes come from a file the tool does not control, so the match loop
+  // is defensive: the built-in rules must still report.
+  const hostile = [
+    { id: "throws", description: "explodes", regex: { test: () => { throw new Error("boom"); } } }
+  ];
+  const found = ruleIds("a.ts", 'k = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";', { customRules: hostile });
+  assert.ok(found.includes("github-pat"));
+});
+
+test("issue #93: custom rules run through scanStaged, including on env templates", () => {
+  // Env templates suppress the heuristic layers but never the high-confidence
+  // ones, and a custom rule is high-confidence by construction.
+  const rules = parseCustomRules(
+    JSON.stringify({ rules: [{ id: "acme-token", description: "ACME token", regex: "\\bacme_[a-z0-9]{10}\\b" }] })
+  ).rules;
+  const read = () => "TOKEN=acme_0123456789";
+
+  const scanned = scanStaged({ ...opts, customRules: rules, allowlist: [], dotenvSecrets: [], files: ["src/a.ts"], read });
+  assert.ok(scanned.findings.some((f) => f.ruleId === "acme-token"));
+
+  const template = scanStaged({ ...opts, customRules: rules, allowlist: [], dotenvSecrets: [], files: [".env.example"], read });
+  assert.ok(template.findings.some((f) => f.ruleId === "acme-token"));
+});
+
+test("issue #93: the pack is read from the home directory, not the repository", () => {
+  // Deliberately not repo-level: a clone would otherwise inject regexes that
+  // run against every line of every staged file, and the failure mode is a
+  // commit hook that never returns.
+  const home = mkdtempSync(join(tmpdir(), "gforge-rules-"));
+  assert.deepEqual(loadCustomRules(home), { rules: [], errors: [] }); // no pack is normal
+
+  mkdirSync(join(home, ".gforge"), { recursive: true });
+  writeFileSync(
+    join(home, ".gforge", "rules.json"),
+    JSON.stringify({ rules: [{ id: "acme-token", description: "ACME token", regex: "\\bacme_[a-z0-9]{10}\\b" }] })
+  );
+
+  const loaded = loadCustomRules(home);
+  assert.deepEqual(loaded.errors, []);
+  assert.deepEqual(loaded.rules.map((r) => r.id), ["acme-token"]);
+  assert.ok(ruleIds("a.ts", 'k = "acme_0123456789"', { customRules: loaded.rules }).includes("acme-token"));
 });
 
 test("issue #94: a shared allowlist applies without a per-repo .gforgeignore", () => {
