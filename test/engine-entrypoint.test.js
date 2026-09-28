@@ -171,6 +171,10 @@ async function serveRegistry(t, { versions }) {
 
 const ago = (ms) => new Date(Date.now() - ms).toISOString();
 
+// Every regex metacharacter, not only ".": a prerelease version such as
+// 1.0.0-beta+build carries a "+", which would otherwise act as an operator.
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 async function waitFor(check, { timeoutMs = 20000, what }) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -228,7 +232,7 @@ test("issue #49: an unattended install is announced exactly once", { skip: posix
 
   const first = await runEngine(m, ["pre-commit"]);
   assert.equal(first.status, 0, first.stderr);
-  assert.match(first.stderr, new RegExp(`auto-updated v0\\.0\\.1 -> v${VERSION.replace(/\./g, "\\.")}`));
+  assert.match(first.stderr, new RegExp(`auto-updated v0\\.0\\.1 -> v${escapeRegExp(VERSION)}`));
   assert.equal(JSON.parse(await readFile(m.cache, "utf8")).installed.announced, true);
 
   const second = await runEngine(m, ["pre-commit"]);
@@ -249,7 +253,7 @@ test("issue #49: a package update that left the hook behind is said out loud", {
 
   const run = await runEngine(m, ["pre-commit"]);
   assert.equal(run.status, 0, run.stderr);
-  assert.match(run.stderr, new RegExp(`updated to v${NEXT_PATCH.replace(/\./g, "\\.")} but the managed hook is still v`));
+  assert.match(run.stderr, new RegExp(`updated to v${escapeRegExp(NEXT_PATCH)} but the managed hook is still v`));
   assert.match(run.stderr, /Run `gforge update`/);
 });
 
@@ -260,7 +264,7 @@ test("issue #49: a pending same-major release is announced, and only when it is 
   await writeFreshCache(m, { latest: NEXT_PATCH, versions: [VERSION, NEXT_PATCH], distTags: { latest: NEXT_PATCH } });
   const pending = await runEngine(m, ["pre-commit"]);
   assert.equal(pending.status, 0, pending.stderr);
-  assert.match(pending.stderr, new RegExp(`v${NEXT_PATCH.replace(/\./g, "\\.")} is available \\(you have v${VERSION.replace(/\./g, "\\.")}\\)`));
+  assert.match(pending.stderr, new RegExp(`v${escapeRegExp(NEXT_PATCH)} is available \\(you have v${escapeRegExp(VERSION)}\\)`));
 
   await writeFreshCache(m, { latest: VERSION, versions: [VERSION], distTags: { latest: VERSION } });
   const current = await runEngine(m, ["pre-commit"]);
@@ -289,7 +293,7 @@ test("issue #49: a matured patch is installed, pinned to the registry that vouch
 
   // The fake npm did not refresh the engine, so this must NOT be logged as a
   // success: the next commit would still run the old rules (issue #83).
-  assert.match(await readFile(m.log, "utf8"), new RegExp(`installed-but-hooks-stale.* ${VERSION.replace(/\./g, "\\.")} -> ${NEXT_PATCH.replace(/\./g, "\\.")}`));
+  assert.match(await readFile(m.log, "utf8"), new RegExp(`installed-but-hooks-stale.* ${escapeRegExp(VERSION)} -> ${escapeRegExp(NEXT_PATCH)}`));
   assert.equal(JSON.parse(await readFile(m.cache, "utf8")).hooksStale.expected, NEXT_PATCH);
   assert.equal(existsSync(m.lock), false, "the worker must release its lock");
 });
@@ -359,11 +363,11 @@ test("issue #49: an ordinary commit triggers the unattended install, and the nex
   const installs = (await npmCalls(m)).filter((call) => call.args[0] === "install");
   assert.deepEqual(installs.map((c) => c.args[2]), [`gforge@${NEXT_PATCH}`]);
   // The fake refreshed the engine, so this time it is a real success.
-  assert.match(await readFile(m.log, "utf8"), new RegExp(` installed patch ${VERSION.replace(/\./g, "\\.")} -> ${NEXT_PATCH.replace(/\./g, "\\.")}`));
+  assert.match(await readFile(m.log, "utf8"), new RegExp(` installed patch ${escapeRegExp(VERSION)} -> ${escapeRegExp(NEXT_PATCH)}`));
 
   // The engine on disk is now the new version, and the next commit - run by
   // it - says what happened.
   const next = await runEngine(m, ["pre-commit"], env);
   assert.equal(next.status, 0, next.stderr);
-  assert.match(next.stderr, new RegExp(`auto-updated v${VERSION.replace(/\./g, "\\.")} -> v${NEXT_PATCH.replace(/\./g, "\\.")}`));
+  assert.match(next.stderr, new RegExp(`auto-updated v${escapeRegExp(VERSION)} -> v${escapeRegExp(NEXT_PATCH)}`));
 });
