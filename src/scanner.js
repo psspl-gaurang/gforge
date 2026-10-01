@@ -1563,7 +1563,12 @@ export function parseVersion(value) {
   return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
 }
 
-function versionIsNewer(latest, current) {
+// Deliberately a copy of npm-update.js's isNewer rather than an import: this
+// file is copied standalone into ~/.gforge/hooks and may only use Node
+// built-ins. Exported so a test can hold the two to the same answers - this one
+// also orders the candidates selectAutoUpdateTarget picks from, so a drift
+// would change which release installs itself unattended (issue #49).
+export function versionIsNewer(latest, current) {
   const pa = String(latest).split(".").map((n) => parseInt(n, 10) || 0);
   const pb = String(current).split(".").map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i += 1) {
