@@ -656,7 +656,7 @@ export function parseAllowlist(text) {
     });
 }
 
-function isPathAllowlisted(filePath, allowlist) {
+export function isPathAllowlisted(filePath, allowlist) {
   return allowlist.some((matcher) => matcher.test(filePath));
 }
 
@@ -801,7 +801,7 @@ export function scanText(filePath, content, options = {}) {
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    if (INLINE_ALLOW.test(line)) continue;
+    if (!options.ignoreInlineAllow && INLINE_ALLOW.test(line)) continue;
     const lineNumber = i + 1;
 
     // Built-ins first, then any user pack. Layered rather than merged at
@@ -938,9 +938,9 @@ export function isExpectedGitReadFailure(error) {
   return typeof error?.status === "number";
 }
 
-function stagedContent(filePath) {
+function stagedContent(filePath, cwd) {
   try {
-    return decodeBlob(git(["show", `:${filePath}`]));
+    return decodeBlob(git(["show", `:${filePath}`], cwd ? { cwd } : {}));
   } catch (error) {
     if (isExpectedGitReadFailure(error)) return null; // submodule/gitlink or not staged.
     throw error; // genuine read failure: fail closed rather than scan nothing.
@@ -956,8 +956,7 @@ function repoRoot() {
   }
 }
 
-function loadAllowlist() {
-  const root = repoRoot();
+export function loadAllowlist(root = repoRoot()) {
   if (!root) return [];
   const patterns = [];
   for (const file of [".gforgeignore", ".gitleaksignore"]) {
@@ -969,7 +968,7 @@ function loadAllowlist() {
 
 function stagedOrWorkingFile(root, relPath) {
   // Prefer the staged version, fall back to the working tree.
-  const staged = stagedContent(relPath);
+  const staged = stagedContent(relPath, root);
   if (staged !== null) return staged;
   try {
     return readFileSync(`${root}/${relPath}`, "utf8");
@@ -1178,6 +1177,44 @@ function runGitleaks() {
   }
 }
 
+// Every check that applies to one file, whatever produced its content: the
+// commit hook reads it from the index, the history scan from past blobs. One
+// function so the two can never disagree about what counts as a leak (issue
+// #88). A null content still gets the filename rule - a committed .env is a
+// finding even when it cannot be read.
+export function scanFileContent(file, content, options = {}) {
+  const { dotenvSecrets = [], customRules = [] } = options;
+  const findings = [];
+
+  const fileRule = matchFilenameRule(file);
+  if (fileRule) {
+    findings.push({ file, line: 0, ruleId: fileRule.id, description: fileRule.description });
+  }
+  if (content === null || content === undefined) return findings;
+
+  // Highest-precision check: a real secret value from .env hardcoded here.
+  for (const secret of dotenvSecrets) {
+    const index = findWordBoundaryIndex(content, secret);
+    if (index !== -1) {
+      findings.push({
+        file,
+        line: content.slice(0, index).split(/\r?\n/).length,
+        ruleId: "hardcoded-dotenv-secret",
+        description: "a secret value from a .env file is hardcoded here"
+      });
+      break; // one is enough to block; do not enumerate values
+    }
+  }
+
+  // Env templates are meant to hold placeholder values, so skip the generic
+  // keyword and entropy rules for them, but still catch a real provider token.
+  const fileOptions = isEnvTemplate(file)
+    ? { ...options, customRules, generic: false, entropy: false }
+    : { ...options, customRules };
+  findings.push(...scanText(file, content, fileOptions));
+  return findings;
+}
+
 export function scanStaged(options = {}) {
   const allowlist = options.allowlist ?? loadAllowlist();
   const files = options.files ?? stagedFiles();
@@ -1189,35 +1226,8 @@ export function scanStaged(options = {}) {
 
   for (const file of files) {
     if (isPathAllowlisted(file, allowlist)) continue;
-
-    const fileRule = matchFilenameRule(file);
-    if (fileRule) {
-      findings.push({ file, line: 0, ruleId: fileRule.id, description: fileRule.description });
-    }
-
     const content = options.read ? options.read(file) : stagedContent(file);
-    if (content === null || content === undefined) continue;
-
-    // Highest-precision check: a real secret value from .env hardcoded here.
-    for (const secret of dotenvSecrets) {
-      const index = findWordBoundaryIndex(content, secret);
-      if (index !== -1) {
-        findings.push({
-          file,
-          line: content.slice(0, index).split(/\r?\n/).length,
-          ruleId: "hardcoded-dotenv-secret",
-          description: "a secret value from a .env file is hardcoded here"
-        });
-        break; // one is enough to block; do not enumerate values
-      }
-    }
-
-    // Env templates are meant to hold placeholder values, so skip the generic
-    // keyword and entropy rules for them, but still catch a real provider token.
-    const fileOptions = isEnvTemplate(file)
-      ? { ...options, customRules: customRulePack.rules, generic: false, entropy: false }
-      : { ...options, customRules: customRulePack.rules };
-    findings.push(...scanText(file, content, fileOptions));
+    findings.push(...scanFileContent(file, content, { ...options, dotenvSecrets, customRules: customRulePack.rules }));
   }
 
   const gitleaks = options.runGitleaks === false ? { available: false, leaks: false } : runGitleaks();
