@@ -1008,6 +1008,114 @@ test("decodes UTF-16/BOM blobs so Windows/PowerShell files are scanned", () => {
   assert.equal(decodeBlob(Buffer.from(secret)), secret);
 });
 
+// ---------------------------------------------------------------------------
+// decodeBlob's remaining branches (issue #50). The test above covers
+// UTF-16LE+BOM, UTF-8+BOM and plain text; these cover UTF-16BE+BOM and the
+// BOM-less UTF-16LE heuristic - the exact case the function's own comment
+// gives as its real-world motivation.
+// ---------------------------------------------------------------------------
+const DECODE_SECRET_LINE = "password=SuperSecretValue123\n";
+const utf16be = (text) => {
+  const buffer = Buffer.from(text, "utf16le");
+  buffer.swap16();
+  return buffer;
+};
+const detectsGenericSecret = (buffer) =>
+  scanText("config.txt", decodeBlob(buffer), { runGitleaks: false }).some((f) => f.ruleId === "generic-secret-assignment");
+
+test("issue #50: UTF-16BE with a BOM round-trips exactly, including non-ASCII text", () => {
+  const bom = Buffer.from([0xfe, 0xff]);
+  assert.equal(decodeBlob(Buffer.concat([bom, utf16be(DECODE_SECRET_LINE)])), DECODE_SECRET_LINE);
+  assert.ok(detectsGenericSecret(Buffer.concat([bom, utf16be(DECODE_SECRET_LINE)])));
+
+  // ASCII alone would pass even if the byte swap were subtly wrong in a way
+  // that happens to leave the high byte zero; multi-byte text would not.
+  const multilingual = "Passwort=Größe · 口令=秘密 · пароль=ключ\n";
+  assert.equal(decodeBlob(Buffer.concat([bom, utf16be(multilingual)])), multilingual);
+});
+
+test("issue #50: BOM-less UTF-16LE is recognised by the NUL-byte heuristic", () => {
+  // PowerShell and .NET writers can emit UTF-16LE with no BOM. Read as
+  // latin1, every ASCII character would be followed by a NUL and no rule
+  // would match - the heuristic is the only thing standing between that file
+  // and an unscanned commit.
+  const bomless = Buffer.from(DECODE_SECRET_LINE, "utf16le");
+  assert.equal(bomless[0] === 0xff || bomless[0] === 0xfe, false, "precondition: no BOM");
+  assert.equal(decodeBlob(bomless), DECODE_SECRET_LINE);
+  assert.ok(detectsGenericSecret(bomless));
+
+  // Without the heuristic, the same bytes are unscannable - which is the
+  // regression this test exists to catch.
+  assert.equal(
+    scanText("config.txt", bomless.toString("latin1"), { runGitleaks: false }).some(
+      (f) => f.ruleId === "generic-secret-assignment"
+    ),
+    false,
+    "read as latin1, a UTF-16 secret matches nothing"
+  );
+});
+
+test("issue #50: the heuristic needs MORE than 70% NULs in the odd byte positions", () => {
+  // 20 bytes means 10 odd positions sampled. Exactly 7 NULs is 0.7, which is
+  // not more than 0.7; 8 is.
+  const withOddNuls = (count) => {
+    const buffer = Buffer.alloc(20, 0x41); // "A" everywhere
+    for (let i = 0; i < count; i += 1) buffer[1 + i * 2] = 0x00;
+    return buffer;
+  };
+
+  assert.equal(decodeBlob(withOddNuls(7)), withOddNuls(7).toString("latin1"), "0.7 stays latin1");
+  assert.equal(decodeBlob(withOddNuls(8)), withOddNuls(8).toString("utf16le"), "0.8 is read as UTF-16LE");
+});
+
+test("issue #50: the heuristic needs at least 4 bytes, and samples only the first 1024", () => {
+  // Three bytes can look 100% UTF-16 by accident; the floor keeps a tiny file
+  // from being reinterpreted on one coincidental NUL.
+  assert.equal(decodeBlob(Buffer.from([0x41, 0x00, 0x42])), "A\0B");
+  assert.equal(decodeBlob(Buffer.from([0x41, 0x00, 0x42, 0x00])), "AB");
+
+  // The sample is bounded so a large file costs the same to classify as a
+  // small one. Plain text in the first KB decides it, whatever follows - and
+  // the UTF-16 tail is large enough that sampling the whole file WOULD tip it
+  // over 70%, so the bound is actually observable here.
+  const textThenUtf16 = Buffer.concat([Buffer.alloc(1024, 0x41), Buffer.from("B".repeat(2048), "utf16le")]);
+  assert.equal(decodeBlob(textThenUtf16), textThenUtf16.toString("latin1"));
+
+  assert.equal(decodeBlob(Buffer.alloc(0)), "");
+  assert.equal(decodeBlob(null), "");
+});
+
+// Two defects this coverage turned up, recorded as `todo` rather than asserted
+// the other way: each test states the CORRECT behaviour, runs, and is reported
+// as TODO without failing the suite until the code is fixed. Both are being
+// reported separately - this change adds tests only.
+test(
+  "issue #50: an odd-length file starting with FE FF does not crash the scan",
+  { todo: "swap16() throws on an odd byte count, so the hook fails closed and blocks the commit" },
+  () => {
+    // Any file that merely begins with the bytes FE FF and has an odd length -
+    // truncated UTF-16BE, or a binary file that happens to start that way. The
+    // UTF-16LE branch silently drops a dangling byte; this one throws, and the
+    // engine then blocks the commit with "secret scan could not complete".
+    assert.doesNotThrow(() => decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])));
+    assert.equal(decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])), "A");
+  }
+);
+
+test(
+  "issue #50: an ASCII secret after a NUL-padded binary header is still found",
+  { todo: "the heuristic reclassifies the whole file from its first KB, destroying later ASCII text" },
+  () => {
+    // A binary-ish header (little-endian 16-bit values, so the odd bytes are
+    // zero) pushes the first-KB sample over 70%, the WHOLE file is decoded as
+    // UTF-16LE, and the ASCII credential after it is paired into garbage.
+    // Read as latin1 it would have matched.
+    const header = Buffer.alloc(600);
+    for (let i = 0; i < header.length; i += 2) header[i] = (i % 97) + 1;
+    assert.ok(detectsGenericSecret(Buffer.concat([header, Buffer.from(DECODE_SECRET_LINE)])));
+  }
+);
+
 test("does not flag trivial non-secret values (PASS=123)", () => {
   assert.equal(ruleIds("config.txt", "PASS=123").length, 0);
   assert.equal(ruleIds("config.txt", "PORT=3000").length, 0);
