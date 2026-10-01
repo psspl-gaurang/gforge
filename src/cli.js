@@ -14,6 +14,7 @@ import {
   performSelfUpgrade,
   readCachedUpdateNotice
 } from "./npm-update.js";
+import { formatHistoryReport, scanHistory } from "./history.js";
 import { describeDotenvSources } from "./scanner.js";
 import { runSettingsCommand } from "./settings.js";
 import { createVerificationReport, formatVerificationReport } from "./verify.js";
@@ -43,6 +44,10 @@ export async function runCli(args, streams, options = {}) {
     return (options.runSettingsCommand ?? runSettingsCommand)(args, streams, options);
   }
 
+  if (command === "history") {
+    return runHistory(args, options, streams);
+  }
+
   if (command === "verify") {
     const environment = await (options.detectEnvironment ?? detectEnvironment)();
     const managedHooksReport = await (options.verifyManagedHooks ?? verifyManagedHooks)({
@@ -60,6 +65,32 @@ export async function runCli(args, streams, options = {}) {
 
   streams.stderr.write(`${banner(streams.stderr)}Unknown command: ${command}\n\n${helpText(streams.stderr)}`);
   return { exitCode: 1 };
+}
+
+// Read-only: scans what is already committed, reports, and changes nothing.
+// Exits 1 when anything is found, so `gforge history` can gate a CI job.
+function runHistory(args, options, streams) {
+  const flags = args.slice(1);
+  const known = ["--all", "--no-allowlist"];
+  const unknown = flags.filter((flag) => !known.includes(flag));
+  if (unknown.length > 0) {
+    streams.stderr.write(`GForge: unknown option for history: ${unknown.join(", ")}\n`);
+    return { exitCode: 1 };
+  }
+
+  const result = (options.scanHistory ?? scanHistory)({
+    cwd: options.cwd,
+    home: options.home,
+    all: flags.includes("--all"),
+    allowlist: !flags.includes("--no-allowlist")
+  });
+  const report = formatHistoryReport(result);
+  if (!result.ok) {
+    streams.stderr.write(report);
+    return { exitCode: 1 };
+  }
+  streams.stdout.write(report);
+  return { exitCode: result.findings.length > 0 ? 1 : 0 };
 }
 
 // install/update first try to upgrade the globally installed package to the
@@ -203,6 +234,7 @@ function helpText(stream) {
     header("Commands:"),
     row("install", "Upgrade to the latest version (if any) and install the hooks"),
     row("verify", "Verify the environment and installed hooks (read-only)"),
+    row("history", "Scan this repo's commit history for secrets; --all, --no-allowlist"),
     row("update", "Upgrade to the latest version (if any) and refresh the hooks"),
     row("uninstall", "Remove GForge-owned hooks and restore your Git config"),
     row("settings", "Show settings; --no-autoupdate / --autoupdate (minor+major)"),
