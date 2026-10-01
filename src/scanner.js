@@ -957,14 +957,65 @@ function repoRoot() {
 }
 
 function loadAllowlist() {
+  // Shared entries first, then the repository's own. Order is presentational
+  // only - any matcher skipping a path is enough - but it keeps the merged list
+  // readable when debugging why a file was not scanned.
+  const patterns = [...loadSharedAllowlist().patterns];
   const root = repoRoot();
-  if (!root) return [];
-  const patterns = [];
+  if (!root) return patterns;
   for (const file of [".gforgeignore", ".gitleaksignore"]) {
     const content = stagedOrWorkingFile(root, file);
     if (content) patterns.push(...parseAllowlist(content));
   }
   return patterns;
+}
+
+// ---------------------------------------------------------------------------
+// Org-shared allowlist: the same format as .gforgeignore, read from
+// ~/.gforge/allowlist so a team can define common false positives once instead
+// of copying a .gforgeignore into every repository (issue #94).
+//
+// An organization distributes the file with whatever configuration management
+// it already uses, or symlinks it into a managed checkout so updates flow
+// without re-copying. Nothing is fetched over the network: a per-commit remote
+// read would put the network on the commit path and make whoever serves the
+// file able to silence scanning everywhere at once.
+//
+// This is the direction that HIDES files, which is why the layer reports
+// itself through `gforge verify` rather than applying invisibly.
+// ---------------------------------------------------------------------------
+export function sharedAllowlistPath(home = homedir()) {
+  return join(home, ".gforge", "allowlist");
+}
+
+export function loadSharedAllowlist(home = homedir()) {
+  let content;
+  try {
+    content = readFileSync(sharedAllowlistPath(home), "utf8");
+  } catch {
+    return { present: false, patterns: [], entryCount: 0, refusedCount: 0 };
+  }
+
+  const entries = String(content)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+
+  return {
+    present: true,
+    patterns: parseAllowlist(content),
+    entryCount: entries.length,
+    // Counted, not just degraded: a refused pattern silently loses its
+    // allowlisting power, and the user who wrote it deserves to be told.
+    refusedCount: entries.filter((entry) => isRiskyAllowlistPattern(entry)).length
+  };
+}
+
+// What `gforge verify` prints for this layer. Never the patterns themselves -
+// an allowlist entry is a path, but paths are still the user's business.
+export function describeSharedAllowlist(home = homedir()) {
+  const { present, entryCount, refusedCount } = loadSharedAllowlist(home);
+  return { path: sharedAllowlistPath(home), present, entryCount, refusedCount };
 }
 
 function stagedOrWorkingFile(root, relPath) {
