@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
@@ -29,6 +29,18 @@ import {
 
 const opts = { runGitleaks: false };
 const ruleIds = (path, text, extra = {}) => scanText(path, text, { ...opts, ...extra }).map((f) => f.ruleId);
+
+// Temp directories are removed once the file finishes - one run used to leave
+// eleven behind in the system temp dir (issue #55).
+const tempDirs = [];
+test.after(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+function makeTempDir(prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
 
 test("detects a generic keyword=value secret (the DB_PASS regression)", () => {
   assert.ok(ruleIds("config.txt", "DB_PASS=psspl@443e").includes("generic-secret-assignment"));
@@ -740,7 +752,7 @@ test("issue #93: the pack is read from the home directory, not the repository", 
   // Deliberately not repo-level: a clone would otherwise inject regexes that
   // run against every line of every staged file, and the failure mode is a
   // commit hook that never returns.
-  const home = mkdtempSync(join(tmpdir(), "gforge-rules-"));
+  const home = makeTempDir("gforge-rules-");
   assert.deepEqual(loadCustomRules(home), { rules: [], errors: [] }); // no pack is normal
 
   mkdirSync(join(home, ".gforge"), { recursive: true });
@@ -754,6 +766,64 @@ test("issue #93: the pack is read from the home directory, not the repository", 
   assert.deepEqual(loaded.rules.map((r) => r.id), ["acme-token"]);
   assert.ok(ruleIds("a.ts", 'k = "acme_0123456789"', { customRules: loaded.rules }).includes("acme-token"));
 });
+
+// ---------------------------------------------------------------------------
+// Classic evasions (issue #55). The issue made no claim either way - only that
+// nothing tested them, so a regression reopening one would go unnoticed. They
+// were measured before these were written, and the answer is mixed, so each
+// test says which layer does the catching rather than just that something did.
+// ---------------------------------------------------------------------------
+const EVASION_STRIPE_TAIL = "4eC39HqLyjWDarjtT1zdp7dc";
+
+test("issue #55: a credential keyword in mixed case is still a credential keyword", () => {
+  for (const line of ['pAsSwOrD = "hunter2Real9xyz"', 'DB_PaSsWoRd="hunter2Real9xyz"', 'ApI_KeY: "hunter2Real9xyz"']) {
+    assert.ok(ruleIds("a.ts", line).includes(GENERIC_SECRET_RULE_ID), `must flag: ${line}`);
+  }
+});
+
+test("issue #55: a provider key split by concatenation is still caught - by entropy, not by name", () => {
+  // The Stripe rule never sees an intact key here: `"sk_live_" + "..."` puts a
+  // quote and a plus between the prefix and the body. What catches it is the
+  // entropy layer, on the long random tail. That dependency is the point of
+  // this test: the entropy layer is quietened in docs, translations and build
+  // output (issue #24), and a concatenated key is not caught there.
+  for (const line of [
+    `const k = "sk_live_" + "${EVASION_STRIPE_TAIL}";`,
+    `const k = "sk_" + "live_" + "${EVASION_STRIPE_TAIL}";`,
+    `const k = \`sk_live_\${"${EVASION_STRIPE_TAIL}"}\`;`
+  ]) {
+    const ids = ruleIds("src/billing.ts", line);
+    assert.ok(ids.includes("high-entropy-string"), `must flag: ${line}`);
+    assert.equal(ids.includes("stripe-secret-key"), false, "precondition: the provider rule cannot see a split key");
+  }
+});
+
+test("issue #55: a provider key wrapped in a base64 decode is still caught - again by entropy", () => {
+  const encoded = Buffer.from(`sk_live_${EVASION_STRIPE_TAIL}`).toString("base64");
+  for (const line of [`const k = atob("${encoded}");`, `const k = Buffer.from("${encoded}", "base64").toString();`]) {
+    assert.ok(ruleIds("src/billing.ts", line).includes("high-entropy-string"), `must flag: ${line}`);
+  }
+});
+
+// Two evasions that currently get through, recorded as `todo`: each states the
+// correct behaviour, runs, and is reported without failing the suite. Both are
+// being reported separately - this change adds tests only.
+test(
+  "issue #55: a short secret split by concatenation next to a credential keyword is caught",
+  { todo: "the generic rule reads only the first quoted piece (3 chars, under its 4-char minimum), and each piece is under entropy's 20" },
+  () => {
+    assert.ok(ruleIds("a.ts", 'const password = "hun" + "ter2Real9xyz";').includes(GENERIC_SECRET_RULE_ID));
+  }
+);
+
+test(
+  "issue #55: a short secret wrapped in a base64 decode next to a credential keyword is caught",
+  { todo: "the generic rule treats a function call as a reference, and the encoded value scores 3.88 bits, under entropy's 4.2" },
+  () => {
+    const encoded = Buffer.from("hunter2Real9xyz").toString("base64");
+    assert.ok(ruleIds("a.ts", `const password = atob("${encoded}");`).includes(GENERIC_SECRET_RULE_ID));
+  }
+);
 
 test("inline gforge:allow suppresses a line", () => {
   assert.equal(ruleIds("a", "DB_PASS=psspl@443e # gforge:allow").length, 0);
@@ -1150,7 +1220,7 @@ test("issue #44: a genuine read failure (buffer overflow, spawn failure) is not 
 // Materializes { "relative/path": "content" } under a fresh temp directory and
 // returns its root, for the .env discovery tests.
 function makeTree(files) {
-  const root = mkdtempSync(join(tmpdir(), "gforge-dotenv-"));
+  const root = makeTempDir("gforge-dotenv-");
   for (const [path, content] of Object.entries(files)) {
     const full = join(root, path);
     mkdirSync(join(full, ".."), { recursive: true });
