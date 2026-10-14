@@ -825,6 +825,214 @@ test(
   }
 );
 
+// Correctly shaped but obviously synthetic, and assembled at runtime rather
+// than written out: a literal, well-formed token in this file trips GitHub's
+// push protection before the commit can even reach the repository. Building
+// the string keeps the fixture honest about the shape the rule has to match.
+const repeatTo = (alphabet, length) => alphabet.repeat(Math.ceil(length / alphabet.length)).slice(0, length);
+const hex = (length) => repeatTo("0123456789abcdef", length);
+const alnum = (length) => repeatTo("abcdefghij0123456789", length);
+const upper = (length) => repeatTo("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", length);
+
+test("issue #95: prefix-anchored provider rules for the newly covered vendors", () => {
+  const cases = [
+    ["vault-token", `token = "hv${"s"}.${alnum(28)}"`],
+    ["atlassian-api-token", `ATLASSIAN_TOKEN=ATATT${3}${alnum(26)}`],
+    ["databricks-token", `DATABRICKS_TOKEN=dap${"i"}${hex(32)}`],
+    ["postman-api-key", `PMA${"K"}-${hex(24)}-${hex(34)}`],
+    ["grafana-token", `key: gls${"a"}_${alnum(32)}_${hex(8)}`],
+    ["linear-api-key", `LINEAR_API_KEY=lin_ap${"i"}_${alnum(40)}`],
+    ["supabase-service-key", `SUPABASE=sb${"p"}_${hex(40)}`],
+    ["newrelic-key", `NEW_RELIC_API_KEY=NRA${"K"}-${upper(27)}`],
+    ["sentry-auth-token", `SENTRY_AUTH_TOKEN=sntry${"s"}_${alnum(36)}`],
+    ["flyio-token", `FLY_API_TOKEN=fm${2}_${alnum(44)}`],
+    ["terraform-cloud-token", `TF_TOKEN=${alnum(14)}.atlasv${1}.${alnum(64)}`]
+  ];
+
+  for (const [id, line] of cases) {
+    assert.ok(ruleIds("config.env", line).includes(id), `${id} must fire`);
+    // Provider rules are high-confidence, so they run where the heuristic
+    // layers are deliberately quiet - docs, build output, translations.
+    assert.ok(ruleIds("docs/setup.md", line).includes(id), `${id} must fire in docs too`);
+  }
+});
+
+test("issue #95: the new rules stay off near-misses rather than matching on shape", () => {
+  // Each one anchors on a literal vendor prefix. Without that discipline these
+  // would be indistinguishable from an ordinary hex or base64 run.
+  const nearMisses = [
+    "const path = require('path'); // hvs is not a token here",
+    "DATABRICKS_HOST=https://dapi.example.com",
+    "const id = 'NRAK-SHORT';",
+    "linear = 'lin_api_tooshort'",
+    "sbp_notlongenough",
+    "version = 'atlasv1'",
+    "const sha = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';"
+  ];
+  const newRuleIds = new Set([
+    "vault-token", "atlassian-api-token", "databricks-token", "postman-api-key",
+    "grafana-token", "linear-api-key", "supabase-service-key", "newrelic-key",
+    "sentry-auth-token", "flyio-token", "terraform-cloud-token"
+  ]);
+
+  for (const line of nearMisses) {
+    const hit = ruleIds("a.ts", line).filter((id) => newRuleIds.has(id));
+    assert.deepEqual(hit, [], `must not fire on: ${line}`);
+  }
+});
+
+test("issue #95: a GCP service-account key is named as one, pretty-printed or minified", () => {
+  // The embedded PEM already trips the private-key rule, but "Private key
+  // block" does not say that a whole Google Cloud identity was committed.
+  const fields = {
+    type: "service_account",
+    project_id: "example",
+    private_key_id: "0123456789abcdef0123456789abcdef01234567",
+    private_key: "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+    client_email: "svc@example.iam.gserviceaccount.com"
+  };
+
+  const pretty = ruleIds("sa.json", JSON.stringify(fields, null, 2));
+  assert.ok(pretty.includes("gcp-service-account-key"));
+  assert.ok(pretty.includes("private-key"), "the PEM rule still fires alongside it");
+
+  // Minified onto one line, which is how these are usually pasted into config.
+  assert.ok(ruleIds("sa.json", JSON.stringify(fields)).includes("gcp-service-account-key"));
+
+  // Still a credential once the PEM has been redacted out of it.
+  const redacted = { ...fields, private_key: "REDACTED" };
+  assert.ok(ruleIds("sa.json", JSON.stringify(redacted, null, 2)).includes("gcp-service-account-key"));
+
+  // A JSON file that merely mentions the words is not one.
+  assert.equal(
+    ruleIds("notes.json", JSON.stringify({ note: "create a service_account and store private_key safely" })).includes(
+      "gcp-service-account-key"
+    ),
+    false
+  );
+  // Nor is a service account with no key material and a placeholder id.
+  assert.equal(
+    ruleIds("sa.json", JSON.stringify({ type: "service_account", private_key_id: "..." }, null, 2)).includes(
+      "gcp-service-account-key"
+    ),
+    false
+  );
+});
+
+test("issue #95: Kubernetes Secret data values are flagged, and only those", () => {
+  const manifest = [
+    "apiVersion: v1",
+    "kind: Secret",
+    "metadata:",
+    "  name: my-very-long-secret-name",
+    "  namespace: production",
+    "type: Opaque",
+    "data:",
+    "  password: cGFzc3dvcmQxMjM0NTY=",
+    "  username: YWRtaW5pc3RyYXRvcg==",
+    "---",
+    "apiVersion: v1",
+    "kind: ConfigMap"
+  ].join("\n");
+
+  const findings = scanText("secret.yaml", manifest, opts).filter((f) => f.ruleId === "k8s-secret-data");
+  // The two data values, and nothing above them: metadata.name is a long
+  // lowercase string too, and flagging it would make every manifest noisy.
+  assert.deepEqual(findings.map((f) => f.line), [8, 9]);
+
+  // stringData holds the plaintext form, which is no less a secret.
+  const stringData = ["kind: Secret", "stringData:", "  password: sup3rsecretvalue"].join("\n");
+  assert.ok(ruleIds("s.yaml", stringData).includes("k8s-secret-data"));
+});
+
+test("issue #95: SealedSecret, templates and non-Secret manifests stay clear", () => {
+  // A SealedSecret holds ciphertext and an ExternalSecret holds a reference;
+  // neither is a secret, so `kind:` is matched as a whole line rather than as
+  // a substring.
+  const sealed = [
+    "apiVersion: bitnami.com/v1alpha1",
+    "kind: SealedSecret",
+    "spec:",
+    "  encryptedData:",
+    "    password: AgBv0Kk3aBcDeFgHiJkLmNoPqRsTuVwXyZ"
+  ].join("\n");
+  assert.equal(ruleIds("sealed.yaml", sealed).includes("k8s-secret-data"), false);
+
+  const external = ["kind: ExternalSecret", "data:", "  password: cGFzc3dvcmQxMjM0NTY="].join("\n");
+  assert.equal(ruleIds("ext.yaml", external).includes("k8s-secret-data"), false);
+
+  // Helm and Kustomize placeholders are references waiting to be rendered.
+  const helm = ["kind: Secret", "data:", "  password: {{ .Values.password | b64enc }}"].join("\n");
+  assert.equal(ruleIds("t.yaml", helm).includes("k8s-secret-data"), false);
+  const env = ["kind: Secret", "data:", "  password: ${DB_PASSWORD}"].join("\n");
+  assert.equal(ruleIds("t.yaml", env).includes("k8s-secret-data"), false);
+
+  // An empty data block is not a leak.
+  assert.equal(ruleIds("s.yaml", ["kind: Secret", "data: {}"].join("\n")).includes("k8s-secret-data"), false);
+
+  // And a ConfigMap is not a Secret, whatever its data looks like.
+  const configMap = ["kind: ConfigMap", "data:", "  greeting: aGVsbG93b3JsZDEyMzQ1"].join("\n");
+  assert.equal(ruleIds("cm.yaml", configMap).includes("k8s-secret-data"), false);
+});
+
+test("issue #95: the Secret kind is resolved per document, not as a running flag", () => {
+  // `kubectl get secret -o yaml` emits keys alphabetically, so `data:` comes
+  // out ABOVE `kind:` - and that output is exactly what gets pasted into a
+  // repo by accident. A sequential "have I seen kind: Secret yet" flag misses
+  // it entirely.
+  const kubectlOutput = [
+    "apiVersion: v1",
+    "data:",
+    "  password: cGFzc3dvcmQxMjM0NTY=",
+    "kind: Secret",
+    "metadata:",
+    "  name: db-credentials",
+    "type: Opaque"
+  ].join("\n");
+  const found = scanText("dump.yaml", kubectlOutput, opts).filter((f) => f.ruleId === "k8s-secret-data");
+  assert.deepEqual(found.map((f) => f.line), [3]);
+
+  // And a multi-document file scopes each kind to its own document, in both
+  // orders - otherwise a ConfigMap sharing the file gets flagged too.
+  const secretThenConfigMap = [
+    "kind: Secret", "data:", "  a: cGFzc3dvcmQxMjM0NTY=",
+    "---",
+    "kind: ConfigMap", "data:", "  b: aGVsbG93b3JsZDEyMzQ1"
+  ].join("\n");
+  assert.deepEqual(
+    scanText("m.yaml", secretThenConfigMap, opts).filter((f) => f.ruleId === "k8s-secret-data").map((f) => f.line),
+    [3]
+  );
+
+  const configMapThenSecret = [
+    "kind: ConfigMap", "data:", "  b: aGVsbG93b3JsZDEyMzQ1",
+    "---",
+    "kind: Secret", "data:", "  a: cGFzc3dvcmQxMjM0NTY="
+  ].join("\n");
+  assert.deepEqual(
+    scanText("m.yaml", configMapThenSecret, opts).filter((f) => f.ruleId === "k8s-secret-data").map((f) => f.line),
+    [7]
+  );
+});
+
+test("issue #93 x #95: a custom pack cannot claim the context rules' ids either", () => {
+  // The reserved-id list is built from PROVIDER_RULES, but the GCP and
+  // Kubernetes rules are context rules that live outside that array. Without
+  // naming them explicitly, a pack could reuse their ids and make a finding's
+  // origin unreadable - the exact thing the reservation exists to prevent.
+  const { rules, errors } = parseCustomRules(
+    JSON.stringify({
+      rules: [
+        { id: "gcp-service-account-key", description: "impostor", regex: "never-matches" },
+        { id: "k8s-secret-data", description: "impostor", regex: "never-matches" }
+      ]
+    })
+  );
+  assert.deepEqual(rules, []);
+  assert.equal(errors.length, 2);
+  for (const error of errors) assert.match(error, /already used by a built-in rule/);
+});
+
 test("inline gforge:allow suppresses a line", () => {
   assert.equal(ruleIds("a", "DB_PASS=psspl@443e # gforge:allow").length, 0);
   assert.equal(ruleIds("a", "DB_PASS=psspl@443e // gitleaks:allow").length, 0);
@@ -1077,6 +1285,114 @@ test("decodes UTF-16/BOM blobs so Windows/PowerShell files are scanned", () => {
   assert.equal(decodeBlob(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(secret)])), secret);
   assert.equal(decodeBlob(Buffer.from(secret)), secret);
 });
+
+// ---------------------------------------------------------------------------
+// decodeBlob's remaining branches (issue #50). The test above covers
+// UTF-16LE+BOM, UTF-8+BOM and plain text; these cover UTF-16BE+BOM and the
+// BOM-less UTF-16LE heuristic - the exact case the function's own comment
+// gives as its real-world motivation.
+// ---------------------------------------------------------------------------
+const DECODE_SECRET_LINE = "password=SuperSecretValue123\n";
+const utf16be = (text) => {
+  const buffer = Buffer.from(text, "utf16le");
+  buffer.swap16();
+  return buffer;
+};
+const detectsGenericSecret = (buffer) =>
+  scanText("config.txt", decodeBlob(buffer), { runGitleaks: false }).some((f) => f.ruleId === "generic-secret-assignment");
+
+test("issue #50: UTF-16BE with a BOM round-trips exactly, including non-ASCII text", () => {
+  const bom = Buffer.from([0xfe, 0xff]);
+  assert.equal(decodeBlob(Buffer.concat([bom, utf16be(DECODE_SECRET_LINE)])), DECODE_SECRET_LINE);
+  assert.ok(detectsGenericSecret(Buffer.concat([bom, utf16be(DECODE_SECRET_LINE)])));
+
+  // ASCII alone would pass even if the byte swap were subtly wrong in a way
+  // that happens to leave the high byte zero; multi-byte text would not.
+  const multilingual = "Passwort=Größe · 口令=秘密 · пароль=ключ\n";
+  assert.equal(decodeBlob(Buffer.concat([bom, utf16be(multilingual)])), multilingual);
+});
+
+test("issue #50: BOM-less UTF-16LE is recognised by the NUL-byte heuristic", () => {
+  // PowerShell and .NET writers can emit UTF-16LE with no BOM. Read as
+  // latin1, every ASCII character would be followed by a NUL and no rule
+  // would match - the heuristic is the only thing standing between that file
+  // and an unscanned commit.
+  const bomless = Buffer.from(DECODE_SECRET_LINE, "utf16le");
+  assert.equal(bomless[0] === 0xff || bomless[0] === 0xfe, false, "precondition: no BOM");
+  assert.equal(decodeBlob(bomless), DECODE_SECRET_LINE);
+  assert.ok(detectsGenericSecret(bomless));
+
+  // Without the heuristic, the same bytes are unscannable - which is the
+  // regression this test exists to catch.
+  assert.equal(
+    scanText("config.txt", bomless.toString("latin1"), { runGitleaks: false }).some(
+      (f) => f.ruleId === "generic-secret-assignment"
+    ),
+    false,
+    "read as latin1, a UTF-16 secret matches nothing"
+  );
+});
+
+test("issue #50: the heuristic needs MORE than 70% NULs in the odd byte positions", () => {
+  // 20 bytes means 10 odd positions sampled. Exactly 7 NULs is 0.7, which is
+  // not more than 0.7; 8 is.
+  const withOddNuls = (count) => {
+    const buffer = Buffer.alloc(20, 0x41); // "A" everywhere
+    for (let i = 0; i < count; i += 1) buffer[1 + i * 2] = 0x00;
+    return buffer;
+  };
+
+  assert.equal(decodeBlob(withOddNuls(7)), withOddNuls(7).toString("latin1"), "0.7 stays latin1");
+  assert.equal(decodeBlob(withOddNuls(8)), withOddNuls(8).toString("utf16le"), "0.8 is read as UTF-16LE");
+});
+
+test("issue #50: the heuristic needs at least 4 bytes, and samples only the first 1024", () => {
+  // Three bytes can look 100% UTF-16 by accident; the floor keeps a tiny file
+  // from being reinterpreted on one coincidental NUL.
+  assert.equal(decodeBlob(Buffer.from([0x41, 0x00, 0x42])), "A\0B");
+  assert.equal(decodeBlob(Buffer.from([0x41, 0x00, 0x42, 0x00])), "AB");
+
+  // The sample is bounded so a large file costs the same to classify as a
+  // small one. Plain text in the first KB decides it, whatever follows - and
+  // the UTF-16 tail is large enough that sampling the whole file WOULD tip it
+  // over 70%, so the bound is actually observable here.
+  const textThenUtf16 = Buffer.concat([Buffer.alloc(1024, 0x41), Buffer.from("B".repeat(2048), "utf16le")]);
+  assert.equal(decodeBlob(textThenUtf16), textThenUtf16.toString("latin1"));
+
+  assert.equal(decodeBlob(Buffer.alloc(0)), "");
+  assert.equal(decodeBlob(null), "");
+});
+
+// Two defects this coverage turned up, recorded as `todo` rather than asserted
+// the other way: each test states the CORRECT behaviour, runs, and is reported
+// as TODO without failing the suite until the code is fixed. Both are being
+// reported separately - this change adds tests only.
+test(
+  "issue #50: an odd-length file starting with FE FF does not crash the scan",
+  { todo: "swap16() throws on an odd byte count, so the hook fails closed and blocks the commit" },
+  () => {
+    // Any file that merely begins with the bytes FE FF and has an odd length -
+    // truncated UTF-16BE, or a binary file that happens to start that way. The
+    // UTF-16LE branch silently drops a dangling byte; this one throws, and the
+    // engine then blocks the commit with "secret scan could not complete".
+    assert.doesNotThrow(() => decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])));
+    assert.equal(decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])), "A");
+  }
+);
+
+test(
+  "issue #50: an ASCII secret after a NUL-padded binary header is still found",
+  { todo: "the heuristic reclassifies the whole file from its first KB, destroying later ASCII text" },
+  () => {
+    // A binary-ish header (little-endian 16-bit values, so the odd bytes are
+    // zero) pushes the first-KB sample over 70%, the WHOLE file is decoded as
+    // UTF-16LE, and the ASCII credential after it is paired into garbage.
+    // Read as latin1 it would have matched.
+    const header = Buffer.alloc(600);
+    for (let i = 0; i < header.length; i += 2) header[i] = (i % 97) + 1;
+    assert.ok(detectsGenericSecret(Buffer.concat([header, Buffer.from(DECODE_SECRET_LINE)])));
+  }
+);
 
 test("does not flag trivial non-secret values (PASS=123)", () => {
   assert.equal(ruleIds("config.txt", "PASS=123").length, 0);
