@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -812,8 +812,19 @@ test("issue #41: no warning when there is no classic hook file, it isn't executa
   assert.equal(report.checks.some((check) => check.label === "classic-hook-shadowed"), false);
 });
 
+// Every test gets a fresh home, and they are removed once the file finishes -
+// one run used to leave 38 directories behind in the system temp dir (issue
+// #55). A file-level hook rather than per-test cleanup, so the 38 call sites
+// keep their one-line setup; this is the pattern staged-files.test.js uses.
+const tempHomes = [];
+test.after(async () => {
+  await Promise.all(tempHomes.map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
 async function createTempHome() {
-  return mkdtemp(join(tmpdir(), "gforge-test-"));
+  const home = await mkdtemp(join(tmpdir(), "gforge-test-"));
+  tempHomes.push(home);
+  return home;
 }
 
 async function shimCheckFor(homePath, git) {
