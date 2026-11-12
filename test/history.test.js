@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { runCli } from "../src/cli.js";
-import { HISTORY_MAX_BLOB_BYTES, formatHistoryReport, scanHistory } from "../src/history.js";
+import { HISTORY_MAX_BLOB_BYTES, chunkVersions, formatHistoryReport, scanHistory } from "../src/history.js";
 
 // ---------------------------------------------------------------------------
 // `gforge history` against real repositories (issue #88). Every git call here
@@ -394,4 +394,35 @@ test("issue #88: `gforge history` exits 1 on findings and 0 when clean, so it ca
   const outside = streams();
   assert.equal((await runCli(["history"], outside.io, { cwd: await tempDir("gforge-history-cli-") })).exitCode, 1);
   assert.match(outside.out.stderr, /not inside a git repository/);
+});
+
+test("issue #134: history is read in bounded runs, and the result matches an unbatched scan", async () => {
+  const r = await makeRepo();
+  // Many distinct benign files, then one leak in the middle and a later one.
+  for (let i = 0; i < 12; i += 1) {
+    await r.write(`data/f${i}.txt`, `${String(i).repeat(2000)}\n`);
+    if (i === 5) await r.write("leak.txt", `${LEAK_OLD}\n`);
+    r.commit(`c${i}`);
+  }
+
+  const baseline = r.scan();
+  const batches = [];
+  const small = r.scan({ batchBytes: 5000, onBatch: (b) => batches.push(b) });
+
+  assert.ok(batches.length > 1, "a small budget must split the scan into several runs");
+  assert.ok(Math.max(...batches.map((b) => b.blobs)) <= 3, "no run holds more than its budget of blobs");
+  assert.equal(small.scannedCount, baseline.scannedCount);
+  assert.deepEqual(ids(small), ids(baseline));
+  assert.equal(baseline.findings.length > 0, true, "the leak is still attributed");
+  assert.equal(small.findings[0].commit.sha, baseline.findings[0].commit.sha);
+});
+
+test("issue #134: chunkVersions bounds each run, keeps order, and isolates a blob over the limit", () => {
+  const sizes = new Map([["a", 40], ["b", 40], ["c", 40], ["big", 500]]);
+  const v = (blob, path) => ({ blob, path });
+  const runs = chunkVersions([v("a", "1"), v("a", "2"), v("b", "3"), v("c", "4"), v("big", "5"), v("a", "6")], sizes, 100);
+
+  // The repeated blob "a" counts once within a run.
+  assert.deepEqual(runs.map((run) => run.map((x) => x.path)), [["1", "2", "3"], ["4"], ["5"], ["6"]]);
+  assert.deepEqual(chunkVersions([], sizes, 100), []);
 });
