@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -266,6 +266,49 @@ test("issue #29: gforge settings --no-autoupdate persists and reports the state"
 
   const onDisk = JSON.parse(await readFile(settingsPath(home), "utf8"));
   assert.deepEqual(onDisk.autoUpdate, { minor: false, major: false });
+});
+
+test("issue #137: a null, primitive or array autoUpdate falls back to the defaults instead of throwing", () => {
+  for (const autoUpdate of [null, true, 5, "off", []]) {
+    const resolved = resolveAutoUpdateSettings({ fileContent: JSON.stringify({ autoUpdate }) });
+    assert.deepEqual(resolved, { minor: true, major: true, source: "settings" }, JSON.stringify(autoUpdate));
+  }
+  // A settings file that is not an object at all is simply unusable.
+  for (const content of ["null", "5", '"x"', "[]", "true"]) {
+    assert.deepEqual(resolveAutoUpdateSettings({ fileContent: content }), { minor: true, major: true, source: "default" }, content);
+  }
+});
+
+test("issue #137: an explicit valid opt-out is unchanged, and a mistyped member never counts as one", () => {
+  assert.deepEqual(
+    resolveAutoUpdateSettings({ fileContent: JSON.stringify({ autoUpdate: { minor: false, major: true } }) }),
+    { minor: false, major: true, source: "settings" }
+  );
+  // Only an explicit `false` opts out.
+  assert.deepEqual(
+    resolveAutoUpdateSettings({ fileContent: JSON.stringify({ autoUpdate: { minor: "false", major: 0 } }) }),
+    { minor: true, major: true, source: "settings" }
+  );
+});
+
+test("issue #137: `gforge settings` inspects and repairs a null autoUpdate without crashing", async () => {
+  const home = await tempHome();
+  await mkdir(dirname(settingsPath(home)), { recursive: true });
+  await writeFile(settingsPath(home), '{"autoUpdate":null,"other":1}\n');
+
+  const inspect = createStreams();
+  assert.equal((await runSettingsCommand(["settings"], inspect, { home, env: {} })).exitCode, 0);
+  assert.match(inspect.out(), /auto-update \(minor\)\s+on/);
+
+  const repair = createStreams();
+  assert.equal((await runSettingsCommand(["settings", "--no-autoupdate"], repair, { home, env: {} })).exitCode, 0);
+  const onDisk = JSON.parse(await readFile(settingsPath(home), "utf8"));
+  assert.deepEqual(onDisk, { autoUpdate: { minor: false, major: false }, other: 1 });
+
+  // A string or array must not be spread character-by-character into the file.
+  await writeFile(settingsPath(home), '{"autoUpdate":"abc"}\n');
+  assert.deepEqual(mergeAutoUpdateSettings('{"autoUpdate":"abc"}', { minor: false }), { autoUpdate: { minor: false } });
+  assert.deepEqual(mergeAutoUpdateSettings('{"autoUpdate":[1,2]}', { minor: false }), { autoUpdate: { minor: false } });
 });
 
 test("issue #29: gforge settings warns when the env var overrides the stored value", async () => {

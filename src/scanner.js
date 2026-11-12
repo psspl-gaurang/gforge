@@ -1734,6 +1734,10 @@ const AFFIRMATIVE = new Set(["1", "true", "on", "yes"]);
 // be the reverse - only 0/false/off/no disabled it - which meant
 // GFORGE_AUTO_UPDATE=disabled, =never or =2 all silently kept auto-installing
 // (issue #29). Anything that is not clearly "yes" now means no.
+export function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 export function resolveAutoUpdateSettings({ fileContent = null, env = {} } = {}) {
   const raw = env.GFORGE_AUTO_UPDATE;
   if (raw !== undefined && String(raw).trim() !== "") {
@@ -1747,11 +1751,17 @@ export function resolveAutoUpdateSettings({ fileContent = null, env = {} } = {})
   } catch {
     parsed = null; // unreadable settings fall back to the defaults
   }
-  const autoUpdate = parsed && typeof parsed.autoUpdate === "object" ? parsed.autoUpdate : {};
+  // typeof null is "object", so a plain shape check selects null and then
+  // dereferences it (issue #137). Only a real object counts; null, a primitive
+  // or an array means "no usable preference" and falls back to the defaults, the
+  // same as unparseable JSON. Only an explicit `false` ever opts a tier out, so a
+  // mistyped member is not mistaken for one.
+  const settings = isPlainObject(parsed) ? parsed : null;
+  const autoUpdate = isPlainObject(settings?.autoUpdate) ? settings.autoUpdate : {};
   return {
     minor: autoUpdate.minor !== false,
     major: autoUpdate.major !== false,
-    source: parsed ? "settings" : "default"
+    source: settings ? "settings" : "default"
   };
 }
 
