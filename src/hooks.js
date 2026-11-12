@@ -83,6 +83,17 @@ export function getManagedFiles(nodePath) {
 
 export const MANAGED_FILE_NAMES = [SCANNER_FILE_NAME, PRE_COMMIT_FILE_NAME];
 
+// The reserved filenames are not proof of ownership: a user can replace
+// pre-commit with their own script (issue #136). These signatures are what every
+// GForge release has written, so uninstall can tell its own files from a
+// replacement and leave the latter alone.
+export function isGforgeManagedContent(name, content) {
+  const text = String(content);
+  if (name === PRE_COMMIT_FILE_NAME) return text.includes("GForge managed pre-commit hook");
+  if (name === SCANNER_FILE_NAME) return text.includes("GForge") && text.includes("pre-commit");
+  return false;
+}
+
 export function resolveManagedDirectory(homePath) {
   return join(homePath, MANAGED_DIRECTORY_NAME);
 }

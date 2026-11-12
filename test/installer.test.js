@@ -287,6 +287,50 @@ test("uninstall leaves non-empty GForge directories in place", async () => {
   assert.equal(await readFile(join(resolveHooksDirectory(homePath), "custom"), "utf8"), "user file\n");
 });
 
+test("issue #136: uninstall preserves a user-replaced pre-commit and says so", async () => {
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+  const preCommit = join(resolveHooksDirectory(homePath), "pre-commit");
+
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  await writeFile(preCommit, "#!/bin/sh\necho my own hook\n");
+
+  const result = await uninstallManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  assert.equal(result.ok, true);
+  assert.equal(await readFile(preCommit, "utf8"), "#!/bin/sh\necho my own hook\n");
+  assert.match(result.messages.join("\n"), /Preserved .*pre-commit: it was not written by GForge/);
+  // GForge's own scanner file is still removed.
+  await assert.rejects(stat(join(resolveHooksDirectory(homePath), SCANNER_FILE_NAME)), { code: "ENOENT" });
+});
+
+test("issue #136: a custom hook with no GForge state at all is never deleted", async () => {
+  const homePath = await createTempHome();
+  const git = createGitConfigMock("/some/other/manager/hooks");
+  const hooksDirectory = resolveHooksDirectory(homePath);
+  await mkdir(hooksDirectory, { recursive: true });
+  await writeFile(join(hooksDirectory, "pre-commit"), "#!/bin/sh\nexit 0\n");
+
+  const result = await uninstallManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  assert.equal(result.ok, true);
+  assert.equal(git.hooksPath(), "/some/other/manager/hooks");
+  assert.equal(await readFile(join(hooksDirectory, "pre-commit"), "utf8"), "#!/bin/sh\nexit 0\n");
+});
+
+test("issue #136: uninstalling an intact install is still complete and idempotent", async () => {
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  const first = await uninstallManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  const second = await uninstallManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  assert.equal(first.ok && second.ok, true);
+  assert.doesNotMatch(first.messages.join("\n"), /Preserved/);
+  await assert.rejects(stat(resolveHooksDirectory(homePath)), { code: "ENOENT" });
+});
+
 async function seedState(homePath, state) {
   await mkdir(resolveManagedDirectory(homePath), { recursive: true });
   await writeFile(resolveStatePath(homePath), typeof state === "string" ? state : JSON.stringify(state));
