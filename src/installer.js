@@ -13,6 +13,7 @@ import {
 } from "./git-config.js";
 import {
   MANAGED_FILE_NAMES,
+  isGforgeManagedContent,
   PRE_COMMIT_FILE_NAME,
   SCANNER_FILE_NAME,
   getManagedFiles,
@@ -184,11 +185,15 @@ export async function uninstallManagedHooks(options = {}) {
     );
   }
 
-  await removeManagedFiles(hooksDirectory, statePath);
+  const preserved = await removeManagedFiles(hooksDirectory, statePath);
   const removedHooksDirectory = await removeEmptyDirectory(hooksDirectory);
   const removedManagedDirectory = await removeEmptyDirectory(managedDirectory);
 
   messages.push("Removed GForge-owned hook and state files");
+
+  for (const path of preserved) {
+    messages.push(`Preserved ${path}: it was not written by GForge. Delete it manually if you no longer need it`);
+  }
 
   if (!removedHooksDirectory || !removedManagedDirectory) {
     messages.push("Left non-empty GForge directories in place");
@@ -527,12 +532,33 @@ async function writeFileAtomic(filePath, content, mode) {
   }
 }
 
+// Removes only files GForge wrote. A reserved filename holding anything else -
+// a user's own pre-commit script, say - is left in place and reported, so the
+// caller can say so (issue #136). Returns the paths that were preserved.
 async function removeManagedFiles(hooksDirectory, statePath) {
+  const preserved = [];
+
   for (const name of MANAGED_FILE_NAMES) {
-    await removeFile(join(hooksDirectory, name));
+    const filePath = join(hooksDirectory, name);
+    let content;
+    try {
+      content = await readFile(filePath, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      // Unreadable or not a regular file: not provably ours, so not ours to delete.
+      preserved.push(filePath);
+      continue;
+    }
+
+    if (isGforgeManagedContent(name, content)) {
+      await removeFile(filePath);
+    } else {
+      preserved.push(filePath);
+    }
   }
 
   await removeFile(statePath);
+  return preserved;
 }
 
 async function removeFile(filePath) {
