@@ -8,6 +8,7 @@ import { createVerificationReport, formatVerificationReport } from "../src/verif
 import {
   hookInvokesScanner,
   installManagedHooks,
+  isValidInstallState,
   uninstallManagedHooks,
   updateManagedHooks,
   verifyManagedHooks
@@ -284,6 +285,71 @@ test("uninstall leaves non-empty GForge directories in place", async () => {
   assert.equal(result.ok, true);
   assert.match(result.messages.join("\n"), /Left non-empty GForge directories in place/);
   assert.equal(await readFile(join(resolveHooksDirectory(homePath), "custom"), "utf8"), "user file\n");
+});
+
+async function seedState(homePath, state) {
+  await mkdir(resolveManagedDirectory(homePath), { recursive: true });
+  await writeFile(resolveStatePath(homePath), typeof state === "string" ? state : JSON.stringify(state));
+}
+
+test("issue #135: a foreign state file's backup is never adopted or restored", async () => {
+  const homePath = await createTempHome();
+  const git = createGitConfigMock("/actual/original/hooks");
+  const foreign = { managedBy: "another-tool", version: 2, previousCoreHooksPath: "/unrelated/backup" };
+  await seedState(homePath, foreign);
+
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  // The foreign file is kept for recovery, and the real original is recorded.
+  assert.deepEqual(JSON.parse(await readFile(`${resolveStatePath(homePath)}.corrupt`, "utf8")), foreign);
+
+  const result = await uninstallManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  assert.equal(result.ok, true);
+  assert.equal(git.hooksPath(), "/actual/original/hooks");
+});
+
+test("issue #135: uninstall does not trust or delete a foreign state file", async () => {
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  const foreign = { managedBy: "another-tool", version: 2, previousCoreHooksPath: "/unrelated/backup" };
+  await seedState(homePath, foreign);
+
+  const result = await uninstallManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+
+  assert.equal(result.ok, true);
+  assert.equal(git.hooksPath(), null, "must not restore an unrelated path");
+  assert.match(result.messages.join("\n"), /not written by this GForge install/);
+  assert.deepEqual(JSON.parse(await readFile(resolveStatePath(homePath), "utf8")), foreign);
+});
+
+test("issue #135: unsupported, null, primitive and mistyped state are all rejected", async () => {
+  const hooks = "/h";
+  const good = { managedBy: "gforge", version: 2, hooksDirectory: hooks, previousCoreHooksPath: "/x" };
+  assert.equal(isValidInstallState(good, hooks), true);
+  assert.equal(isValidInstallState({ ...good, previousCoreHooksPath: null }, hooks), true);
+  for (const bad of [
+    null, 5, "gforge", [], {},
+    { ...good, version: 99 },
+    { ...good, managedBy: "x" },
+    { ...good, hooksDirectory: "/elsewhere" },
+    { ...good, previousCoreHooksPath: 7 },
+    { ...good, previousCoreHooksPath: "" },
+    { ...good, previousCoreHooksPath: hooks }
+  ]) {
+    assert.equal(isValidInstallState(bad, hooks), false, JSON.stringify(bad));
+  }
+});
+
+test("issue #135: a valid recorded-null backup survives reinstall and unsets on uninstall", async () => {
+  const homePath = await createTempHome();
+  const git = createGitConfigMock();
+
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  await installManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  assert.equal(JSON.parse(await readFile(resolveStatePath(homePath), "utf8")).previousCoreHooksPath, null);
+
+  await uninstallManagedHooks({ environment: createEnvironment(homePath), execFile: git.execFile });
+  assert.equal(git.hooksPath(), null);
 });
 
 test("verify reports missing managed hooks", async () => {
