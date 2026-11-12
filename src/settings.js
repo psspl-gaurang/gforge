@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import { resolveAutoUpdateSettings, settingsPath } from "./scanner.js";
+import { isPlainObject, resolveAutoUpdateSettings, settingsPath } from "./scanner.js";
 
 // Persisted user preferences, deliberately separate from state.json: the
 // installer rewrites that file on every update, so a preference stored there
@@ -21,14 +21,17 @@ export function mergeAutoUpdateSettings(fileContent, change) {
   let existing = {};
   try {
     const parsed = fileContent ? JSON.parse(fileContent) : null;
-    if (parsed && typeof parsed === "object") existing = parsed;
+    if (isPlainObject(parsed)) existing = parsed;
   } catch {
     existing = {};
   }
 
   return {
     ...existing,
-    autoUpdate: { ...(existing.autoUpdate ?? {}), ...change }
+    // Spreading a string or array here would copy its characters or indices into
+    // the settings file; a malformed value is replaced, which is how a bad file
+    // gets repaired by `gforge settings --autoupdate` (issue #137).
+    autoUpdate: { ...(isPlainObject(existing.autoUpdate) ? existing.autoUpdate : {}), ...change }
   };
 }
 
