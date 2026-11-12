@@ -139,7 +139,9 @@ export async function uninstallManagedHooks(options = {}) {
   const managedDirectory = resolveManagedDirectory(homePath);
   const hooksDirectory = resolveHooksDirectory(homePath);
   const statePath = resolveStatePath(homePath);
-  const { state, corrupt } = await readStateFile(statePath);
+  const { present, corrupt, state: parsedState } = await readStateFile(statePath);
+  const foreign = present && !corrupt && !isValidInstallState(parsedState, hooksDirectory);
+  const state = foreign ? null : parsedState;
 
   // getGlobalHooksPath() already distinguishes "genuinely not configured"
   // (returns null) from an unexpected read failure (throws) - do NOT flatten
@@ -174,7 +176,9 @@ export async function uninstallManagedHooks(options = {}) {
       messages.push(
         corrupt
           ? "Unset global core.hooksPath; GForge state file was unreadable so no prior value could be restored"
-          : "Removed global core.hooksPath managed by GForge"
+          : foreign
+            ? `Unset global core.hooksPath; ${statePath} was not written by this GForge install, so no prior value was restored and the file was left for you to review`
+            : "Removed global core.hooksPath managed by GForge"
       );
     }
   } else {
@@ -185,11 +189,13 @@ export async function uninstallManagedHooks(options = {}) {
     );
   }
 
-  const preserved = await removeManagedFiles(hooksDirectory, statePath);
+  const preserved = await removeManagedFiles(hooksDirectory, statePath, { keepState: foreign });
   const removedHooksDirectory = await removeEmptyDirectory(hooksDirectory);
   const removedManagedDirectory = await removeEmptyDirectory(managedDirectory);
 
-  messages.push("Removed GForge-owned hook and state files");
+  messages.push(
+    foreign ? "Removed GForge-owned hook files" : "Removed GForge-owned hook and state files"
+  );
 
   for (const path of preserved) {
     messages.push(`Preserved ${path}: it was not written by GForge. Delete it manually if you no longer need it`);
@@ -535,7 +541,7 @@ async function writeFileAtomic(filePath, content, mode) {
 // Removes only files GForge wrote. A reserved filename holding anything else -
 // a user's own pre-commit script, say - is left in place and reported, so the
 // caller can say so (issue #136). Returns the paths that were preserved.
-async function removeManagedFiles(hooksDirectory, statePath) {
+async function removeManagedFiles(hooksDirectory, statePath, { keepState = false } = {}) {
   const preserved = [];
 
   for (const name of MANAGED_FILE_NAMES) {
@@ -557,7 +563,8 @@ async function removeManagedFiles(hooksDirectory, statePath) {
     }
   }
 
-  await removeFile(statePath);
+  // A foreign state file is not GForge's to delete (issue #135).
+  if (!keepState) await removeFile(statePath);
   return preserved;
 }
 
@@ -589,11 +596,13 @@ async function removeEmptyDirectory(directoryPath) {
 }
 
 async function writeInstallState(statePath, hooksDirectory, currentHooksPath, nodePath) {
-  const { corrupt, state: existingState } = await readStateFile(statePath);
+  const { present, corrupt, state: parsedState } = await readStateFile(statePath);
+  const foreign = present && !corrupt && !isValidInstallState(parsedState, hooksDirectory);
+  const existingState = foreign ? null : parsedState;
 
-  if (corrupt) {
-    // Never silently discard an unreadable backup; preserve it for recovery
-    // rather than overwriting the only record of the original hooks path.
+  if (corrupt || foreign) {
+    // Never silently discard an unreadable or foreign state file; preserve it
+    // for recovery, and do not adopt a backup GForge did not record itself.
     await preserveCorruptState(statePath);
   }
 
@@ -639,6 +648,26 @@ async function readStateFile(statePath) {
   } catch {
     return { present: true, corrupt: true, state: null };
   }
+}
+
+const SUPPORTED_STATE_VERSIONS = [1, 2];
+
+// A parseable file is not necessarily GForge's. Before its backup is trusted
+// for restoration it must be an object GForge wrote, at a version this code
+// understands, for this hooks directory, with a backup that is a path or an
+// explicit null (issue #135). Anything else is foreign: it is neither adopted
+// nor deleted.
+export function isValidInstallState(state, hooksDirectory) {
+  if (!state || typeof state !== "object" || Array.isArray(state)) return false;
+  if (state.managedBy !== "gforge") return false;
+  if (!SUPPORTED_STATE_VERSIONS.includes(state.version)) return false;
+  if (state.hooksDirectory !== hooksDirectory) return false;
+
+  const backup = state.previousCoreHooksPath;
+  if (backup === undefined) return true; // older installs: no backup recorded
+  if (backup === null) return true;
+  // The managed directory is never a valid place to restore to.
+  return typeof backup === "string" && backup.length > 0 && backup !== hooksDirectory;
 }
 
 async function preserveCorruptState(statePath) {
