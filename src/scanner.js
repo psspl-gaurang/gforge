@@ -360,6 +360,16 @@ function looksLikeSelfDescriptiveLabel(value) {
   return ratioOf(letters, /[aeiou]/gi) >= SELF_LABEL_MIN_VOWEL_RATIO;
 }
 
+// `credentials: 'include'` is the Fetch API's credentials mode, an enum rather
+// than a credential. Narrow on purpose: the key must be exactly `credentials`
+// and the value exactly one of the three modes (issue #144).
+const FETCH_CREDENTIALS_MODES = new Set(["include", "same-origin", "omit"]);
+function isFetchCredentialsMode(value, keyContext) {
+  if (!FETCH_CREDENTIALS_MODES.has(String(value).toLowerCase()) || !keyContext) return false;
+  const key = keyContext.match(KEY_IDENTIFIER_RE);
+  return Boolean(key) && key[1].toLowerCase().split(".").pop() === "credentials";
+}
+
 function echoesItsKey(value, keyContext) {
   if (!keyContext) return false;
   const key = keyContext.match(KEY_IDENTIFIER_RE);
@@ -414,14 +424,23 @@ export function looksLikeHardcodedSecret(rawValue, options = {}) {
     // is a variable reference, not a literal. In config/env/YAML files an unquoted
     // bare word IS the literal value, so only exempt this for code files.
     if (options.codeFile && /^[A-Za-z_$][\w$]*$/.test(value)) return false;
+    // ...and so is an identifier carrying generic or index punctuation:
+    // AuthState<TUser>, createContext<AuthContextValue, payload['accessToken'
+    // (the value is cut at whitespace). A bare unquoted credential literal does
+    // not occur in code (issue #145).
+    if (options.codeFile && /^[A-Za-z_$][\w$]*[<>\[\]]/.test(value)) return false;
   }
   // A translated label, not a credential. Narrow on purpose: the value must be
   // PURE non-Latin text (no ASCII letters or digits) and must sit in a data file,
   // so a human-chosen password in application code — password = "пароль123", or
   // even bare "пароль" — is still flagged.
   if (!options.codeFile && NON_LATIN_LETTER_RE.test(value) && !/[A-Za-z0-9]/.test(value)) return false;
-  // Env-name-like placeholders (DB_PASSWORD) and common dummy values.
+  // Env-name-like placeholders (DB_PASSWORD) and common dummy values. A
+  // __DUNDER__ wrapper is the same idea, as template tokens are written
+  // (issue #148).
   if (/^[A-Z][A-Z0-9_]{2,}$/.test(value)) return false;
+  if (/^_{1,2}[A-Z][A-Z0-9_]*_{1,2}$/.test(value)) return false;
+  if (isFetchCredentialsMode(value, options.keyContext)) return false;
   if (VALUE_PLACEHOLDER_RE.test(value)) return false;
   if (echoesItsKey(value, options.keyContext)) return false;
   if (/^<.*>$/.test(value) || value === "...") return false;
@@ -518,6 +537,28 @@ const LOCKFILE_NAMES = new Set([
   "composer.lock", "gemfile.lock", "go.sum", "cargo.lock", "poetry.lock",
   "podfile.lock", "flake.lock"
 ]);
+
+// The password in `scheme://user:PASSWORD@host`, judged like any other
+// credential value: a template placeholder (YOUR_PASSWORD, changeme), an
+// env-style name (DB_PASSWORD), or an interpolation (${DB_PASSWORD}, $DB_PASS,
+// {{password}}, <password>) is not a leak. Every URL on the line is checked,
+// so a placeholder cannot shield a real one beside it (issue #146).
+const URL_PASSWORD_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:([^/\s:@]{3,})@/gi;
+function hasLiteralUrlPassword(line) {
+  for (const [, password] of line.matchAll(URL_PASSWORD_RE)) {
+    if (/\$|\{\{|%\(|<%|#\{|^<.*>$/.test(password)) continue;
+    if (/^_{0,2}[A-Z][A-Z0-9]*_[A-Z0-9_]+$/.test(password)) continue;
+    if (VALUE_PLACEHOLDER_RE.test(password)) continue;
+    return true;
+  }
+  return false;
+}
+
+// Inline image and font payloads (`data:image/webp;base64,...`) are binary
+// content, never credentials, and are one long base64 token to the entropy
+// layer. Only those media types: `data:text/plain;base64,` could carry anything
+// (issue #147).
+const INLINE_MEDIA_DATA_URI_RE = /data:(?:image|font)\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/gi;
 
 export function shannonEntropy(str) {
   if (!str) return 0;
@@ -912,6 +953,7 @@ export function scanText(filePath, content, options = {}) {
     // (issue #93).
     for (const rule of PROVIDER_RULES) {
       if (rule.regex.test(line)) {
+        if (rule.id === "basic-auth-url" && !hasLiteralUrlPassword(line)) continue;
         findings.push({ file: filePath, line: lineNumber, ruleId: rule.id, description: rule.description });
       }
     }
@@ -976,7 +1018,7 @@ export function scanText(filePath, content, options = {}) {
     }
 
     // One entropy finding per line is enough.
-    if (!skipEntropy && hasHighEntropyToken(line)) {
+    if (!skipEntropy && hasHighEntropyToken(line.replace(INLINE_MEDIA_DATA_URI_RE, "data:"))) {
       findings.push({
         file: filePath,
         line: lineNumber,
