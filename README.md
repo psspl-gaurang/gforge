@@ -118,6 +118,7 @@ gforge <command> [--force]
 | --- | --- |
 | `gforge install` | Upgrade to the latest version (if any) and install the global hooks. |
 | `gforge verify` | Read-only health check of the environment, the installed hooks, and (inside a repo) the `.env` files the cross-reference can see. |
+| `gforge history` | Scan the current repository's existing commit history for secrets committed before GForge was installed. Read-only. See [Scanning existing history](#scanning-existing-history). |
 | `gforge update` | Upgrade to the latest version (if any) and refresh the hooks. |
 | `gforge uninstall` | Remove GForge-owned hooks and restore your previous Git config. |
 | `gforge version` | Print the installed version. |
@@ -139,8 +140,15 @@ value**. Detection runs several layers in order:
    `server/.env` and `client/.env` are covered. Template files are skipped, and
    the search prunes vendored and build directories (`node_modules`, `dist`, …).
    `gforge verify` prints which `.env` files this layer found.
-2. **Provider rules** — fixed credential shapes for the major cloud and SaaS providers,
-   plus any [custom rules](#custom-rule-packs) you define for your own formats.
+2. **Provider rules** — fixed credential shapes for the major cloud and SaaS
+   providers: AWS, GCP (API keys, OAuth secrets and service-account key files),
+   Azure, GitHub, GitLab, Slack, Stripe, Twilio, SendGrid, OpenAI, Anthropic,
+   HashiCorp Vault, Atlassian, Databricks, Grafana, Linear, Supabase, New Relic,
+   Sentry, Fly.io, Terraform Cloud, Postman, private keys, JWTs, and Kubernetes
+   `Secret` manifests. Every rule anchors on a literal vendor prefix or document
+   shape, so providers whose credentials are a bare hex or base64 run with no
+   prefix are deliberately left to layers 3 and 4 rather than matched on length
+   alone. Add your own formats with [custom rules](#custom-rule-packs).
 3. **Generic secrets** — credential keywords assigned to a hardcoded value; smart
    enough to ignore `process.env.*`, function calls, `${VAR}` interpolation, and
    obvious placeholders.
@@ -209,6 +217,44 @@ rules keep running, so a malformed file never disables scanning.
 
 An organization distributes the file with whatever configuration management it
 already uses — GForge never fetches rules over the network.
+
+## Scanning existing history
+
+The commit hook only sees what is staged next, so a secret committed last year —
+or before GForge existed — is invisible to it. `gforge history` closes that gap.
+Run it from anywhere inside a repository; nothing is installed per repo:
+
+```bash
+gforge history                 # everything reachable from HEAD, like `git log`
+gforge history --all           # every branch and tag
+gforge history --no-allowlist  # ignore .gforgeignore and gforge:allow markers
+```
+
+```
+GForge history scan - 2 potential secrets in 2 commits
+
+  3f9a1c07b2de  2025-03-11
+    ✗ config.txt:1  [generic-secret-assignment] hardcoded value assigned to a credential keyword
+
+  8c41e6d0a957  2025-11-02
+    ✗ deploy/.env  [secret-file-env] .env file (may contain secrets)  (still in HEAD)
+```
+
+It applies exactly the checks the commit hook does, to every past version of
+every file — including files deleted since and content that first appeared in a
+merge. Each finding names the commit that **introduced** it, and
+`(still in HEAD)` marks a leak that is still in the current tree rather than only
+in history. Values are never printed. It exits `1` when anything is found, so it
+can gate a CI job.
+
+A secret that was ever pushed should be treated as compromised: **rotate it
+first**. Rewriting history removes the copy, not the exposure.
+
+Anything not scanned is listed under *Not scanned*, never skipped silently:
+versions hidden by `.gforgeignore` (rerun with `--no-allowlist` to audit a
+repository whose own allowlist you do not trust), file versions over 10 MB, and
+the history a shallow or partial clone does not hold locally. In a partial
+clone, GForge reports the missing versions rather than downloading them.
 
 ## Managing false positives
 

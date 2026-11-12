@@ -133,3 +133,59 @@ test("issue #52: MIN_NODE_MAJOR stays in sync with package.json engines.node", a
     `MIN_NODE_MAJOR (${MIN_NODE_MAJOR}) must match package.json engines.node (${pkg.engines.node})`
   );
 });
+
+// ---------------------------------------------------------------------------
+// The Windows and WSL branches (issue #55). These run on every platform: the
+// platform and environment are injected, so a Linux CI runner exercises the
+// win32 code paths too.
+// ---------------------------------------------------------------------------
+const detectOn = (platform, env) =>
+  detectEnvironment({
+    env,
+    platform,
+    arch: "x64",
+    homeDirectory: platform === "win32" ? "C:/Users/example" : "/home/example",
+    execFile: async () => ({ stdout: "git version 2.45.0\n" })
+  });
+
+test("issue #55: on Windows, a SHELL exported by Git Bash is the shell", async () => {
+  const environment = await detectOn("win32", { SHELL: "/usr/bin/bash", ComSpec: "C:/Windows/System32/cmd.exe" });
+  assert.equal(environment.shell.name, "bash");
+  assert.equal(environment.shell.supported, true);
+  assert.equal(environment.platform.isWsl, false);
+});
+
+test("issue #55: on Windows, SHELL outranks both the pwsh marker and ComSpec", async () => {
+  // SHELL is the only one of the three that names a live, interactive shell;
+  // the pwsh marker and ComSpec are inherited by processes that are neither.
+  const environment = await detectOn("win32", {
+    SHELL: "/usr/bin/bash",
+    POWERSHELL_DISTRIBUTION_CHANNEL: "MSI:Windows 10",
+    ComSpec: "C:/Windows/System32/cmd.exe"
+  });
+  assert.equal(environment.shell.name, "bash");
+});
+
+test(
+  "issue #55: on Windows, a SHELL given in Windows form still reads as bash",
+  { todo: "normalizeShellName strips .exe only for powershell.exe and pwsh.exe, so bash.exe reads as unsupported" },
+  async () => {
+    // The function already maps powershell.exe and pwsh.exe to their names, so
+    // the same form of bash reading as an unsupported shell is inconsistent.
+    // The field is informational - hooks run through git's own sh - but it
+    // surfaces as a shell WARN in `gforge verify`.
+    const environment = await detectOn("win32", { SHELL: "C:\\Program Files\\Git\\usr\\bin\\bash.exe" });
+    assert.equal(environment.shell.name, "bash");
+    assert.equal(environment.shell.supported, true);
+  }
+);
+
+test("issue #55: WSL is flagged from WSL_DISTRO_NAME, and only on Linux", async () => {
+  assert.equal((await detectOn("linux", { SHELL: "/bin/bash", WSL_DISTRO_NAME: "Ubuntu" })).platform.isWsl, true);
+  assert.equal((await detectOn("linux", { SHELL: "/bin/bash" })).platform.isWsl, false);
+  // Present but empty is not a distribution.
+  assert.equal((await detectOn("linux", { SHELL: "/bin/bash", WSL_DISTRO_NAME: "" })).platform.isWsl, false);
+  // The variable leaks into Windows processes started from WSL; the Windows
+  // side of that boundary is not WSL.
+  assert.equal((await detectOn("win32", { SHELL: "/usr/bin/bash", WSL_DISTRO_NAME: "Ubuntu" })).platform.isWsl, false);
+});
