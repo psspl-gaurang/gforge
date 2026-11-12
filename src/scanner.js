@@ -1027,7 +1027,12 @@ export function decodeBlob(buf) {
   if (!buf || buf.length === 0) return "";
   if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return buf.toString("utf16le", 2);
   if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
-    const swapped = Buffer.from(buf.subarray(2));
+    // swap16 throws on an odd byte count, and a truncated or binary file that
+    // merely starts FE FF can have one. Drop the dangling half code unit, as the
+    // UTF-16LE branch already does; every complete unit is still scanned
+    // (issue #138).
+    const body = buf.subarray(2);
+    const swapped = Buffer.from(body.subarray(0, body.length - (body.length % 2)));
     swapped.swap16();
     return swapped.toString("utf16le");
   }

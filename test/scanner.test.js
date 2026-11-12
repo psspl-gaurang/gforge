@@ -1363,22 +1363,39 @@ test("issue #50: the heuristic needs at least 4 bytes, and samples only the firs
   assert.equal(decodeBlob(null), "");
 });
 
-// Two defects this coverage turned up, recorded as `todo` rather than asserted
-// the other way: each test states the CORRECT behaviour, runs, and is reported
-// as TODO without failing the suite until the code is fixed. Both are being
-// reported separately - this change adds tests only.
-test(
-  "issue #50: an odd-length file starting with FE FF does not crash the scan",
-  { todo: "swap16() throws on an odd byte count, so the hook fails closed and blocks the commit" },
-  () => {
-    // Any file that merely begins with the bytes FE FF and has an odd length -
-    // truncated UTF-16BE, or a binary file that happens to start that way. The
-    // UTF-16LE branch silently drops a dangling byte; this one throws, and the
-    // engine then blocks the commit with "secret scan could not complete".
-    assert.doesNotThrow(() => decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])));
-    assert.equal(decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])), "A");
-  }
-);
+// A defect this coverage turned up, recorded as `todo` rather than asserted the
+// other way: the test states the CORRECT behaviour, runs, and is reported as
+// TODO without failing the suite until the code is fixed.
+//
+// The odd-length UTF-16BE crash that used to be recorded here is fixed (issue
+// #138); its regression follows.
+test("issue #138: an odd-length file starting with FE FF does not crash the scan", () => {
+  // Any file that merely begins with FE FF and has an odd length - truncated
+  // UTF-16BE, or a binary file that happens to start that way. swap16 throws on
+  // an odd byte count, which blocked the commit with "secret scan could not
+  // complete". The dangling byte is dropped, as the UTF-16LE branch does.
+  assert.doesNotThrow(() => decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])));
+  assert.equal(decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00])), "A");
+  assert.equal(decodeBlob(Buffer.from([0xfe, 0xff, 0x41])), "");
+});
+
+test("issue #138: empty, BOM-only, even-length and malformed UTF-16BE all decode without throwing", () => {
+  assert.equal(decodeBlob(Buffer.alloc(0)), "");
+  assert.equal(decodeBlob(Buffer.from([0xfe, 0xff])), "");
+  assert.equal(decodeBlob(Buffer.from([0xfe, 0xff, 0x00, 0x41, 0x00, 0x42])), "AB");
+  // A lone surrogate is malformed UTF-16; it must still decode to something.
+  assert.doesNotThrow(() => decodeBlob(Buffer.from([0xfe, 0xff, 0xd8, 0x00, 0x00])));
+});
+
+test("issue #138: a secret in UTF-16BE is still found when the file has a trailing odd byte", () => {
+  const text = `${DECODE_SECRET_LINE}\n`;
+  const be = Buffer.alloc(2 + text.length * 2 + 1);
+  be[0] = 0xfe;
+  be[1] = 0xff;
+  for (let i = 0; i < text.length; i += 1) be.writeUInt16BE(text.charCodeAt(i), 2 + i * 2);
+  be[be.length - 1] = 0x41; // the dangling half of a code unit
+  assert.ok(detectsGenericSecret(be));
+});
 
 test(
   "issue #50: an ASCII secret after a NUL-padded binary header is still found",
