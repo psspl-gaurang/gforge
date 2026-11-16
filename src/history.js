@@ -113,42 +113,60 @@ function readSizes(cwd, blobs) {
   return sizes;
 }
 
-// "<sha> <type> <size>\n<content>\n" repeated, read in batches so no single
-// call returns more than BATCH_BYTES.
-function readContents(cwd, blobs, sizes) {
+// "<sha> <type> <size>\n<content>\n" repeated, for ONE batch of blobs. The
+// caller sizes the batch; a failed call returns nothing, and those versions are
+// reported as unavailable instead of aborting the audit.
+function readContents(cwd, blobs) {
   const contents = new Map();
-  let batch = [];
-  let batchBytes = 0;
+  if (blobs.length === 0) return contents;
+  const result = git(cwd, ["cat-file", "--batch"], `${blobs.join("\n")}\n`);
+  if (result.status !== 0) return contents;
 
-  const flush = () => {
-    if (batch.length === 0) return;
-    const output = git(cwd, ["cat-file", "--batch"], `${batch.join("\n")}\n`).stdout;
-    let offset = 0;
-    while (offset < output.length) {
-      const headerEnd = output.indexOf(0x0a, offset);
-      if (headerEnd === -1) break;
-      const [sha, type, size] = output.subarray(offset, headerEnd).toString("utf8").split(" ");
-      if (type !== "blob") {
-        offset = headerEnd + 1;
-        continue;
-      }
-      const start = headerEnd + 1;
-      const end = start + Number(size);
-      contents.set(sha, output.subarray(start, end));
-      offset = end + 1; // the trailing newline after each object
+  const output = result.stdout;
+  let offset = 0;
+  while (offset < output.length) {
+    const headerEnd = output.indexOf(0x0a, offset);
+    if (headerEnd === -1) break;
+    const [sha, type, size] = output.subarray(offset, headerEnd).toString("utf8").split(" ");
+    if (type !== "blob") {
+      offset = headerEnd + 1;
+      continue;
     }
-    batch = [];
-    batchBytes = 0;
-  };
-
-  for (const blob of blobs) {
-    const size = sizes.get(blob);
-    if (batchBytes > 0 && batchBytes + size > BATCH_BYTES) flush();
-    batch.push(blob);
-    batchBytes += size;
+    const start = headerEnd + 1;
+    const end = start + Number(size);
+    contents.set(sha, output.subarray(start, end));
+    offset = end + 1; // the trailing newline after each object
   }
-  flush();
   return contents;
+}
+
+// Groups versions into runs whose distinct blobs total at most `limit` bytes
+// (a single blob larger than that gets a run of its own), so only one run's
+// content is ever held at once. Order is preserved; a blob shared by versions
+// in different runs is simply read again rather than cached for the whole scan.
+export function chunkVersions(versions, sizes, limit) {
+  const runs = [];
+  let run = [];
+  let blobs = new Set();
+  let bytes = 0;
+
+  for (const version of versions) {
+    const size = sizes.get(version.blob);
+    const extra = blobs.has(version.blob) ? 0 : size;
+    if (run.length > 0 && bytes + extra > limit) {
+      runs.push(run);
+      run = [];
+      blobs = new Set();
+      bytes = 0;
+    }
+    run.push(version);
+    if (!blobs.has(version.blob)) {
+      blobs.add(version.blob);
+      bytes += size;
+    }
+  }
+  if (run.length > 0) runs.push(run);
+  return runs;
 }
 
 // "(version, path)" pairs at HEAD, so each finding can say whether the leak is
@@ -204,8 +222,6 @@ export function scanHistory(options = {}) {
   const { commits, versions } = parseRawLog(log.stdout.toString("utf8"));
   const blobs = [...new Set(versions.map((v) => v.blob))];
   const sizes = readSizes(root, blobs);
-  const scannable = blobs.filter((b) => sizes.has(b) && sizes.get(b) <= HISTORY_MAX_BLOB_BYTES);
-  const contents = readContents(root, scannable, sizes);
   const atHead = all || gitText(root, ["rev-parse", "--verify", "--quiet", "HEAD"]) ? versionsAtHead(root) : new Set();
 
   const allowlist = useAllowlist ? (options.allowlistPatterns ?? loadAllowlist(root)) : [];
@@ -218,30 +234,43 @@ export function scanHistory(options = {}) {
   const unavailable = [];
   let scannedCount = 0;
 
+  const toScan = [];
   for (const version of versions) {
     if (isPathAllowlisted(version.path, allowlist)) {
       allowlisted.push(version);
-      continue;
-    }
-    if (!sizes.has(version.blob)) {
+    } else if (!sizes.has(version.blob)) {
       unavailable.push(version);
-      continue;
-    }
-    if (sizes.get(version.blob) > HISTORY_MAX_BLOB_BYTES) {
+    } else if (sizes.get(version.blob) > HISTORY_MAX_BLOB_BYTES) {
       oversized.push({ ...version, size: sizes.get(version.blob) });
-      continue;
+    } else {
+      toScan.push(version);
     }
+  }
 
-    scannedCount += 1;
-    const content = decodeBlob(contents.get(version.blob));
-    const fileFindings = scanFileContent(version.path, content, {
-      dotenvSecrets,
-      customRules: pack.rules,
-      // An audit must not be blindable by the repository being audited.
-      ignoreInlineAllow: !useAllowlist
-    });
-    const inHead = atHead.has(`${version.blob}\0${version.path}`);
-    for (const finding of fileFindings) findings.push({ ...finding, commit: version.commit, inHead });
+  // Content is read and released one bounded run at a time, so memory follows
+  // the batch size rather than the total size of history (issue #134).
+  const batchBytes = options.batchBytes ?? BATCH_BYTES;
+  for (const run of chunkVersions(toScan, sizes, batchBytes)) {
+    const contents = readContents(root, [...new Set(run.map((v) => v.blob))]);
+    options.onBatch?.({ versions: run.length, blobs: contents.size });
+
+    for (const version of run) {
+      const raw = contents.get(version.blob);
+      if (raw === undefined) {
+        unavailable.push(version);
+        continue;
+      }
+
+      scannedCount += 1;
+      const fileFindings = scanFileContent(version.path, decodeBlob(raw), {
+        dotenvSecrets,
+        customRules: pack.rules,
+        // An audit must not be blindable by the repository being audited.
+        ignoreInlineAllow: !useAllowlist
+      });
+      const inHead = atHead.has(`${version.blob}\0${version.path}`);
+      for (const finding of fileFindings) findings.push({ ...finding, commit: version.commit, inHead });
+    }
   }
 
   findings.sort(
