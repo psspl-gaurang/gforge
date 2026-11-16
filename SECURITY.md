@@ -49,6 +49,9 @@ GForge manages global Git hook configuration. Security-sensitive areas include:
 - Secret detection logic.
 - Logging output.
 - Uninstall behavior.
+- Network use. Today the only network use is the off-commit update check. Live
+  credential verification is not implemented and does not run; see the GH-127
+  decision record in `PLAN.md`.
 
 ## Response Expectations
 
