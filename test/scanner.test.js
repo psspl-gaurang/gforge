@@ -1496,6 +1496,38 @@ test("issue #146: a placeholder password in a connection URL is not a leak", () 
   );
 });
 
+test("issue #146: a `$` inside a literal URL password is a character, not a reference", () => {
+  // The filter skipped ANY password containing `$`, so these plain credentials
+  // stopped being reported. Only a password that is a reference as a whole is one.
+  const D = "$";
+  for (const url of [`postgres://admin:Pa${D}${D}w0rd123@db.example.com/prod`, `mongodb://root:S3cr3t${D}2024@mongo.example.com:27017`]) {
+    assert.ok(ruleIds("config.txt", `DATABASE_URL=${url}`).includes("basic-auth-url"), "a dollar-bearing literal must flag");
+  }
+  // Whole-password references, in the shapes real files use, stay quiet.
+  for (const url of [
+    `postgres://app:${D}DB_PASS@db/app`,
+    `postgres://app:${D}${D}DB_PASS@db/app`, // Makefile, docker-compose
+    `postgres://app:${D}DB_PREFIX${D}DB_SUFFIX@db/app`,
+    `mysql://{${D}user}:{${D}pass}@{${D}host}/db`, // PHP
+    `mysql://app:${D}this->pass@db/app`,
+    `jdbc://app:${D}cfg.password@db/app`,
+    "postgresql://{user}:{password}@{host}/db" // Python f-string, C# interpolation
+  ]) {
+    assert.equal(ruleIds("deploy.sh", `URL="${url}"`).includes("basic-auth-url"), false, url);
+  }
+});
+
+test("issue #151: a password-only URL (redis://:password@host) is reported", () => {
+  assert.ok(ruleIds("config.txt", "REDIS_URL=redis://:hunter2Real9@cache.internal:6379/0").includes("basic-auth-url"));
+  assert.ok(ruleIds("celery.py", 'broker_url = "redis://:hunter2Real9@cache.internal:6379/0"').includes("basic-auth-url"));
+  // The same placeholder and reference handling applies with no user part.
+  for (const url of ["redis://:REDIS_PASSWORD@cache:6379", "redis://:changeme@cache:6379", "redis://:${REDIS_PASSWORD}@cache:6379", "redis://:{password}@{host}"]) {
+    assert.equal(ruleIds(".env.example", `REDIS_URL="${url}"`).includes("basic-auth-url"), false, url);
+  }
+  // A port is not a password, and neither is an address in prose.
+  assert.equal(ruleIds("notes.md", "see https://example.com:8080/path or mail a@b.co").includes("basic-auth-url"), false);
+});
+
 test("issue #147: an inline image or font data URI is not scored for entropy", () => {
   const payload = "xK9mQ2pL7vR4tB8nZ3cW6yH1jF5dG0sA+/xK9mQ2pL7vR4tB8nZ3cW6yH1jF5dG0s";
   assert.equal(ruleIds("logo.svg", `<image href="data:image/webp;base64,${payload}"/>`).includes("high-entropy-string"), false);

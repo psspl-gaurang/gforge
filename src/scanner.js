@@ -146,7 +146,7 @@ export const PROVIDER_RULES = [
   { id: "flyio-token", description: "Fly.io API token", regex: /\bfm[12][a-z]?_[A-Za-z0-9+/=_-]{40,}/ },
   { id: "terraform-cloud-token", description: "Terraform Cloud/Enterprise token", regex: /\b[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_-]{60,}/ },
   { id: "jwt", description: "JSON Web Token", regex: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/ },
-  { id: "basic-auth-url", description: "Credentials embedded in URL", regex: /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s:@]{3,}@/i }
+  { id: "basic-auth-url", description: "Credentials embedded in URL", regex: /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]*:[^/\s:@]{3,}@/i }
 ];
 
 // Generic credential-keyword assignment (e.g. DB_PASS=..., password: "..."),
@@ -543,10 +543,23 @@ const LOCKFILE_NAMES = new Set([
 // env-style name (DB_PASSWORD), or an interpolation (${DB_PASSWORD}, $DB_PASS,
 // {{password}}, <password>) is not a leak. Every URL on the line is checked,
 // so a placeholder cannot shield a real one beside it (issue #146).
-const URL_PASSWORD_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:([^/\s:@]{3,})@/gi;
+//
+// The user part may be empty: `redis://:password@host` is the standard
+// password-only form for Redis and Celery brokers. This pattern and the
+// basic-auth-url rule above must keep the same shape, or the rule can match a
+// URL this one cannot see and the finding is dropped.
+const URL_PASSWORD_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]*:([^/\s:@]{3,})@/gi;
+// A `$` makes the password a reference only when the WHOLE of it is one:
+// $VAR, $$VAR (Makefile, compose), $A$B, {$var}, $this->pass, $cfg.password.
+// A dollar inside a literal (Pa$$w0rd123, S3cr3t$2024) is just a character, and
+// skipping on any `$` let those through. A literal that happens to look exactly
+// like a variable ($ecret) is still read as one, the same call the generic rule
+// makes for a value starting with `$`.
+const URL_PASSWORD_REFERENCE_RE =
+  /^\{?\$\$?[A-Za-z_]\w*(?:(?:->|\.)[A-Za-z_]\w*|\$\$?[A-Za-z_]\w*)*\}?$|\$\{|\$\(|\{\{|%\(|<%|#\{|^<.*>$|^\{[A-Za-z_][\w.]*\}$/;
 function hasLiteralUrlPassword(line) {
   for (const [, password] of line.matchAll(URL_PASSWORD_RE)) {
-    if (/\$|\{\{|%\(|<%|#\{|^<.*>$/.test(password)) continue;
+    if (URL_PASSWORD_REFERENCE_RE.test(password)) continue;
     if (/^_{0,2}[A-Z][A-Z0-9]*_[A-Z0-9_]+$/.test(password)) continue;
     if (VALUE_PLACEHOLDER_RE.test(password)) continue;
     return true;
