@@ -1077,17 +1077,26 @@ function repoRoot() {
   }
 }
 
-export function loadAllowlist(root = repoRoot()) {
-  // Shared entries first, then the repository's own. Order is presentational
-  // only - any matcher skipping a path is enough - but it keeps the merged list
-  // readable when debugging why a file was not scanned.
-  const patterns = [...loadSharedAllowlist().patterns];
+// The repository's own entries only (.gforgeignore, .gitleaksignore). Separate
+// from the shared file so a caller can say WHICH layer hid a path.
+export function loadRepoAllowlist(root = repoRoot()) {
+  const patterns = [];
   if (!root) return patterns;
   for (const file of [".gforgeignore", ".gitleaksignore"]) {
     const content = stagedOrWorkingFile(root, file);
     if (content) patterns.push(...parseAllowlist(content));
   }
   return patterns;
+}
+
+// `home` is a parameter, like every other reader of ~/.gforge, so a caller that
+// was given a home (a test, `gforge history` under an injected one) never falls
+// back to the real one for this layer alone.
+export function loadAllowlist(root = repoRoot(), home = homedir()) {
+  // Shared entries first, then the repository's own. Order is presentational
+  // only - any matcher skipping a path is enough - but it keeps the merged list
+  // readable when debugging why a file was not scanned.
+  return [...loadSharedAllowlist(home).patterns, ...loadRepoAllowlist(root)];
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,12 +1397,12 @@ export function scanFileContent(file, content, options = {}) {
 }
 
 export function scanStaged(options = {}) {
-  const allowlist = options.allowlist ?? loadAllowlist();
+  const allowlist = options.allowlist ?? loadAllowlist(undefined, options.home);
   const files = options.files ?? stagedFiles();
   const dotenvSecrets = options.dotenvSecrets ?? loadDotenvSecrets();
   // Loaded once per commit rather than per file: the pack is small, but
   // recompiling its regexes for every staged path would be pure waste.
-  const customRulePack = options.customRules ? { rules: options.customRules, errors: [] } : loadCustomRules();
+  const customRulePack = options.customRules ? { rules: options.customRules, errors: [] } : loadCustomRules(options.home);
   const findings = [];
 
   for (const file of files) {

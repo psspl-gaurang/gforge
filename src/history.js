@@ -16,7 +16,8 @@ import { spawnSync } from "node:child_process";
 import {
   decodeBlob,
   isPathAllowlisted,
-  loadAllowlist,
+  loadRepoAllowlist,
+  loadSharedAllowlist,
   loadCustomRules,
   loadDotenvSecrets,
   scanFileContent
@@ -224,20 +225,30 @@ export function scanHistory(options = {}) {
   const sizes = readSizes(root, blobs);
   const atHead = all || gitText(root, ["rev-parse", "--verify", "--quiet", "HEAD"]) ? versionsAtHead(root) : new Set();
 
-  const allowlist = useAllowlist ? (options.allowlistPatterns ?? loadAllowlist(root)) : [];
+  // The two layers are kept apart so the report can name the one that hid a
+  // version: pointing an auditor at a .gforgeignore the repository does not have,
+  // when a machine-level file did the hiding, sends them looking in the wrong
+  // place. Injected patterns count as the repository's.
+  const repoAllowlist = useAllowlist ? (options.allowlistPatterns ?? loadRepoAllowlist(root)) : [];
+  const sharedAllowlist =
+    useAllowlist && !options.allowlistPatterns ? loadSharedAllowlist(options.home).patterns : [];
   const dotenvSecrets = options.dotenvSecrets ?? loadDotenvSecrets(root);
   const pack = options.customRules ? { rules: options.customRules, errors: [] } : loadCustomRules(options.home);
 
   const findings = [];
   const allowlisted = [];
+  let sharedAllowlistedCount = 0; // hidden by ~/.gforge/allowlist and by nothing in the repository
   const oversized = [];
   const unavailable = [];
   let scannedCount = 0;
 
   const toScan = [];
   for (const version of versions) {
-    if (isPathAllowlisted(version.path, allowlist)) {
+    if (isPathAllowlisted(version.path, repoAllowlist)) {
       allowlisted.push(version);
+    } else if (isPathAllowlisted(version.path, sharedAllowlist)) {
+      allowlisted.push(version);
+      sharedAllowlistedCount += 1;
     } else if (!sizes.has(version.blob)) {
       unavailable.push(version);
     } else if (sizes.get(version.blob) > HISTORY_MAX_BLOB_BYTES) {
@@ -283,6 +294,7 @@ export function scanHistory(options = {}) {
     scannedCount,
     findings,
     allowlistedCount: allowlisted.length,
+    sharedAllowlistedCount,
     oversized,
     unavailableCount: unavailable.length,
     shallow: gitText(root, ["rev-parse", "--is-shallow-repository"]) === "true",
@@ -333,10 +345,13 @@ export function formatHistoryReport(result) {
   // quietly mean "clean, apart from what was skipped".
   const caveats = [];
   if (result.allowlistedCount > 0) {
-    caveats.push(
-      `${plural(result.allowlistedCount, "file version")} skipped by .gforgeignore/.gitleaksignore - ` +
-        "rerun with --no-allowlist to include them"
-    );
+    // Counts and file names only, never the entries themselves.
+    const shared = result.sharedAllowlistedCount ?? 0;
+    const repo = result.allowlistedCount - shared;
+    const sources = [];
+    if (repo > 0) sources.push(`${plural(repo, "file version")} skipped by .gforgeignore/.gitleaksignore`);
+    if (shared > 0) sources.push(`${plural(shared, "file version")} skipped by the shared allowlist (~/.gforge/allowlist)`);
+    caveats.push(`${sources.join(", ")} - rerun with --no-allowlist to include them`);
   }
   if (result.oversized?.length > 0) {
     const shown = result.oversized
