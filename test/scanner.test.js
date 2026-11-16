@@ -1442,3 +1442,104 @@ function relativeDotenvFiles(root) {
     .map((file) => relative(root, file).split(/[\\/]/).join("/"))
     .sort();
 }
+
+// ---------------------------------------------------------------------------
+// False positives found running `gforge history` on a real TypeScript project
+// (issues #144-#148). Each pairs the benign shape with a neighbour that must
+// still flag, so a fix cannot quietly become a blanket exemption.
+// ---------------------------------------------------------------------------
+test("issue #144: a fetch credentials mode is an enum, not a secret", () => {
+  for (const line of [
+    "credentials: 'include',",
+    'credentials: "same-origin",',
+    "  credentials = 'omit'",
+    "* `credentials: 'include'` is required: the refresh token travels only in the"
+  ]) {
+    assert.equal(ruleIds("src/http.ts", line).includes(GENERIC_SECRET_RULE_ID), false, `must not flag: ${line}`);
+  }
+  // Only the exact key and the exact modes: nothing else is exempted.
+  for (const line of ["credentials: 'include123',", "password: 'include',", "secret: 'omit',", "apiCredentials: 'omit',"]) {
+    assert.ok(ruleIds("src/http.ts", line).includes(GENERIC_SECRET_RULE_ID), `must flag: ${line}`);
+  }
+});
+
+test("issue #145: TypeScript generics and index expressions are not credential literals", () => {
+  for (const line of [
+    "export interface AuthState<TUser extends AuthUser = AuthUser> {",
+    "export const AuthContext = createContext<AuthContextValue | null>(null);",
+    "export type AuthEnv = Pick<",
+    "return { user: parseAuthUser(payload['user']), accessToken: payload['accessToken'] };"
+  ]) {
+    assert.equal(ruleIds("src/auth.ts", line).includes(GENERIC_SECRET_RULE_ID), false, `must not flag: ${line}`);
+  }
+  // Quoted literals in code, and unquoted values in config files, still flag.
+  assert.ok(ruleIds("src/auth.ts", 'const password = "hunter2Real9xyz";').includes(GENERIC_SECRET_RULE_ID));
+  assert.ok(ruleIds("config.yml", "password: hunter2<x>").includes(GENERIC_SECRET_RULE_ID));
+});
+
+test("issue #146: a placeholder password in a connection URL is not a leak", () => {
+  for (const url of [
+    "postgresql://postgres:YOUR_PASSWORD@localhost:5432/db",
+    "postgresql://app:changeme@localhost/db",
+    "postgresql://app:<password>@localhost/db",
+    "postgresql://app:${DB_PASSWORD}@localhost/db",
+    "postgresql://app:{{password}}@localhost/db",
+    "postgresql://app:$DB_PASSWORD@localhost/db",
+    "postgresql://app:DB_PASSWORD@localhost/db"
+  ]) {
+    assert.equal(ruleIds(".env.example", `DATABASE_URL="${url}"`).includes("basic-auth-url"), false, url);
+  }
+  assert.ok(ruleIds("a.ts", 'const u = "postgresql://admin:S3cr3tReal9xyz@db.example.com/app";').includes("basic-auth-url"));
+  // A placeholder beside a real credential must not shield it.
+  assert.ok(
+    ruleIds("a.ts", "a=postgresql://u:YOUR_PASSWORD@h/db b=postgresql://admin:S3cr3tReal9xyz@h/db").includes("basic-auth-url")
+  );
+});
+
+test("issue #146: a `$` inside a literal URL password is a character, not a reference", () => {
+  // The filter skipped ANY password containing `$`, so these plain credentials
+  // stopped being reported. Only a password that is a reference as a whole is one.
+  const D = "$";
+  for (const url of [`postgres://admin:Pa${D}${D}w0rd123@db.example.com/prod`, `mongodb://root:S3cr3t${D}2024@mongo.example.com:27017`]) {
+    assert.ok(ruleIds("config.txt", `DATABASE_URL=${url}`).includes("basic-auth-url"), "a dollar-bearing literal must flag");
+  }
+  // Whole-password references, in the shapes real files use, stay quiet.
+  for (const url of [
+    `postgres://app:${D}DB_PASS@db/app`,
+    `postgres://app:${D}${D}DB_PASS@db/app`, // Makefile, docker-compose
+    `postgres://app:${D}DB_PREFIX${D}DB_SUFFIX@db/app`,
+    `mysql://{${D}user}:{${D}pass}@{${D}host}/db`, // PHP
+    `mysql://app:${D}this->pass@db/app`,
+    `jdbc://app:${D}cfg.password@db/app`,
+    "postgresql://{user}:{password}@{host}/db" // Python f-string, C# interpolation
+  ]) {
+    assert.equal(ruleIds("deploy.sh", `URL="${url}"`).includes("basic-auth-url"), false, url);
+  }
+});
+
+test("issue #151: a password-only URL (redis://:password@host) is reported", () => {
+  assert.ok(ruleIds("config.txt", "REDIS_URL=redis://:hunter2Real9@cache.internal:6379/0").includes("basic-auth-url"));
+  assert.ok(ruleIds("celery.py", 'broker_url = "redis://:hunter2Real9@cache.internal:6379/0"').includes("basic-auth-url"));
+  // The same placeholder and reference handling applies with no user part.
+  for (const url of ["redis://:REDIS_PASSWORD@cache:6379", "redis://:changeme@cache:6379", "redis://:${REDIS_PASSWORD}@cache:6379", "redis://:{password}@{host}"]) {
+    assert.equal(ruleIds(".env.example", `REDIS_URL="${url}"`).includes("basic-auth-url"), false, url);
+  }
+  // A port is not a password, and neither is an address in prose.
+  assert.equal(ruleIds("notes.md", "see https://example.com:8080/path or mail a@b.co").includes("basic-auth-url"), false);
+});
+
+test("issue #147: an inline image or font data URI is not scored for entropy", () => {
+  const payload = "xK9mQ2pL7vR4tB8nZ3cW6yH1jF5dG0sA+/xK9mQ2pL7vR4tB8nZ3cW6yH1jF5dG0s";
+  assert.equal(ruleIds("logo.svg", `<image href="data:image/webp;base64,${payload}"/>`).includes("high-entropy-string"), false);
+  assert.equal(ruleIds("a.css", `src: url(data:font/woff2;base64,${payload});`).includes("high-entropy-string"), false);
+  // Other media types, and a secret beside the image, are still scored.
+  assert.ok(ruleIds("a.ts", `const x = "data:text/plain;base64,${payload}";`).includes("high-entropy-string"));
+  assert.ok(ruleIds("logo.svg", `<image href="data:image/png;base64,AAAA"/> ${payload}`).includes("high-entropy-string"));
+});
+
+test("issue #148: a __DUNDER__ placeholder is not a hardcoded credential", () => {
+  for (const line of ["token = \"__TRACKED_VAR__\"", "-H 'Authorization: Bearer __TRACKED_VAR__'", "secret: __REPLACE_ME__"]) {
+    assert.equal(ruleIds("a.ts", line).includes(GENERIC_SECRET_RULE_ID), false, `must not flag: ${line}`);
+  }
+  assert.ok(ruleIds("a.ts", 'token = "__aB3xK9mQ2p__"').includes(GENERIC_SECRET_RULE_ID));
+});
