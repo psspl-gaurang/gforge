@@ -265,6 +265,45 @@ test("issue #88: the allowlist applies, is counted, and --no-allowlist overrides
   assert.equal(audit.allowlistedCount, 0);
 });
 
+test("issue #94: a skip made by the shared allowlist is attributed to it, from the home the scan was given", async () => {
+  // Two things at once. The shared file is read from the injected home, never
+  // the real one - otherwise this suite's results depend on the machine running
+  // it. And the report names the layer that hid each version: a repository with
+  // no .gforgeignore must not be blamed for a machine-level entry.
+  const r = await makeRepo();
+  await mkdir(join(r.home, ".gforge"), { recursive: true });
+  await writeFile(join(r.home, ".gforge", "allowlist"), "^tooling/\n");
+  await r.write("tooling/sample.txt", `${LEAK_OLD}\n`);
+  r.commit("init");
+
+  const sharedOnly = r.scan();
+  assert.deepEqual(ids(sharedOnly), []);
+  assert.equal(sharedOnly.allowlistedCount, 1);
+  assert.equal(sharedOnly.sharedAllowlistedCount, 1);
+  const report = formatHistoryReport(sharedOnly);
+  assert.match(report, /1 file version skipped by the shared allowlist \(~\/\.gforge\/allowlist\) - rerun with --no-allowlist/);
+  assert.doesNotMatch(report, /\.gforgeignore/);
+
+  // Both layers in play: each is counted once, and a path both match is the
+  // repository's.
+  await r.write(".gforgeignore", "^fixtures/\n^tooling/both\\.txt$\n");
+  await r.write("fixtures/sample.txt", `${LEAK_OLD}\n`);
+  await r.write("tooling/both.txt", `${LEAK_OLD}\n`);
+  r.commit("more");
+  const both = r.scan();
+  assert.equal(both.allowlistedCount, 3);
+  assert.equal(both.sharedAllowlistedCount, 1);
+  assert.match(
+    formatHistoryReport(both),
+    /2 file versions skipped by \.gforgeignore\/\.gitleaksignore, 1 file version skipped by the shared allowlist \(~\/\.gforge\/allowlist\) - rerun/
+  );
+
+  // --no-allowlist switches off both layers.
+  const audit = r.scan({ allowlist: false });
+  assert.equal(audit.allowlistedCount, 0);
+  assert.ok(ids(audit).includes("tooling/sample.txt:1 generic-secret-assignment"));
+});
+
 // ---------------------------------------------------------------------------
 // Everything not scanned is said out loud.
 // ---------------------------------------------------------------------------

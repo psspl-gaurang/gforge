@@ -136,6 +136,38 @@ test("issue #42: informational WARNs still pass, so CI does not break on a missi
   assert.equal(/Not protected/.test(formatVerificationReport(classicDormant)), false);
 });
 
+test("issue #94: verify reports the shared allowlist, since it makes GForge scan less", () => {
+  // It lives outside the repository, so nothing in a project's own files hints
+  // that it is in effect. A clean verify must still say what is being skipped.
+  const none = createVerificationReport(healthyEnvironment(), null, null, null);
+  assert.equal(none.checks.some((check) => check.label === "shared-allowlist"), false);
+
+  const active = createVerificationReport(healthyEnvironment(), null, null, {
+    path: "/home/dev/.gforge/allowlist",
+    present: true,
+    entryCount: 3,
+    refusedCount: 0
+  });
+  const check = active.checks.find((c) => c.label === "shared-allowlist");
+  assert.equal(check.status, "PASS");
+  assert.match(check.detail, /3 entr\(ies\) from \/home\/dev\/\.gforge\/allowlist/);
+  // A deliberate allowlist is a choice, not a protection gap.
+  assert.equal(check.blocking, undefined);
+  assert.deepEqual(active.blocking, []);
+
+  // A refused entry stopped allowlisting, which its author did not intend.
+  const refused = createVerificationReport(healthyEnvironment(), null, null, {
+    path: "/home/dev/.gforge/allowlist",
+    present: true,
+    entryCount: 2,
+    refusedCount: 1
+  });
+  const warned = refused.checks.find((c) => c.label === "shared-allowlist");
+  assert.equal(warned.status, "WARN");
+  assert.match(warned.detail, /1 refused/);
+  assert.equal(warned.blocking, undefined);
+});
+
 test("issue #42: a FAIL still fails, and combines with blocking checks", () => {
   const report = createVerificationReport({
     platform: { name: "linux", arch: "x64", supported: true },
