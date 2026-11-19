@@ -283,6 +283,14 @@ those backtrack catastrophically and would otherwise hang the hook. A refused
 pattern falls back to substring matching, so it loses its allowlisting power
 rather than silently hiding files.
 
+### Local hooks are not a server boundary
+
+Because a commit can skip the hook (`--no-verify`, or a machine without GForge),
+GForge is early, private prevention, not enforcement. Organizations that need a
+boundary nobody can bypass should enable their Git host's push protection, or run
+an existing scanner from a server pre-receive hook. GForge ships no server
+component.
+
 ## Staying up to date
 
 `gforge update` upgrades the package to the latest published release and refreshes

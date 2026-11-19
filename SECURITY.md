@@ -50,6 +50,10 @@ GForge manages global Git hook configuration. Security-sensitive areas include:
 - Logging output.
 - Uninstall behavior.
 
+Server-side enforcement (pre-receive hooks, host push protection) is out of
+scope: GForge ships no server component. Local hooks can be bypassed, so orgs
+that need an enforcement boundary should use their Git host's protection.
+
 ## Response Expectations
 
 The maintainer will review valid reports, ask for clarification if needed, and prioritize fixes based on risk and project maturity.
