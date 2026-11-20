@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
 
+import { formatHistoryReport } from "../src/history.js";
 import {
+  COMPOSITE_WINDOW_LINES,
+  CONFIDENCE_REASONS,
+  CONFIDENCE_STATUS,
   GENERIC_SECRET_RULE_ID,
   collectDotenvFiles,
   decodeBlob,
@@ -1423,6 +1427,311 @@ test("issue #44: a genuine read failure (buffer overflow, spawn failure) is not 
   // process exit either.
   assert.equal(isExpectedGitReadFailure({ status: undefined, code: "ENOENT" }), false);
   assert.equal(isExpectedGitReadFailure(new Error("boom")), false);
+});
+
+// ---------------------------------------------------------------------------
+// Offline confidence and composite pairs (issue #129).
+// Fixtures stay in this file: it is the path .gforgeignore already allowlists.
+// ---------------------------------------------------------------------------
+// Bodies are joined at runtime. A contiguous access-key id, or ten or more
+// characters assigned beside a key name, is a credential literal.
+const AWS_ACCESS_KEY = "AKIA" + "IOSFODNN7EXAMPLE";
+const AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+const CF_API_TOKEN = `${"Gz9".repeat(13)}Q`;
+const CF_GLOBAL_KEY = `${"ab".repeat(18)}c`;
+const DD_API_KEY = "ab".repeat(16);
+const DD_APP_KEY = "cd".repeat(20);
+const ALGOLIA_APP_ID = "ABCD123456";
+const ALGOLIA_ADMIN_KEY = hex(32);
+const DISCORD_BOT = `M${"a".repeat(23)}.${"b".repeat(6)}.${"c".repeat(27)}`;
+const JWT_WELL_FORMED = `eyJ${"a".repeat(11)}.eyJ${"b".repeat(11)}.${"c".repeat(14)}`;
+const JWT_MALFORMED = `eyJ${"a".repeat(10)}.eyJ${"b".repeat(10)}.${"c".repeat(13)}`;
+const COMPOSITE_IDS = [
+  "aws-secret-access-key",
+  "cloudflare-api-token",
+  "cloudflare-global-api-key",
+  "datadog-api-key",
+  "datadog-app-key",
+  "algolia-api-key",
+  "discord-bot-token"
+];
+
+function findingById(findings, ruleId) {
+  const found = findings.filter((finding) => finding.ruleId === ruleId);
+  assert.equal(found.length, 1, ruleId);
+  return found[0];
+}
+
+function gap(n) {
+  return Array.from({ length: n }, () => "const n = 1;");
+}
+
+test("issue #129: a complete pair is attributed to each field's own line", () => {
+  assert.equal(COMPOSITE_WINDOW_LINES, 20);
+  assert.deepEqual(CONFIDENCE_REASONS, ["provider-shape", "structural-check", "credential-key", "paired-field"]);
+  assert.equal(AWS_SECRET_ACCESS_KEY.length, 40);
+  assert.equal(CF_API_TOKEN.length, 40);
+  assert.equal(CF_GLOBAL_KEY.length, 37);
+  assert.equal(DD_API_KEY.length, 32);
+  assert.equal(DD_APP_KEY.length, 40);
+  assert.equal(ALGOLIA_APP_ID.length, 10);
+  assert.equal(ALGOLIA_ADMIN_KEY.length, 32);
+
+  const aws = [
+    `aws_access_key_id=${AWS_ACCESS_KEY}`,
+    `aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}`
+  ].join("\n");
+  const awsFindings = scanText("creds.env", aws, opts);
+  const access = findingById(awsFindings, "aws-access-key-id");
+  const secret = findingById(awsFindings, "aws-secret-access-key");
+  assert.equal(access.file, "creds.env");
+  assert.equal(access.line, 1);
+  assert.equal(secret.file, "creds.env");
+  assert.equal(secret.line, 2);
+  assert.equal(access.status, CONFIDENCE_STATUS);
+  assert.equal(secret.status, CONFIDENCE_STATUS);
+  assert.deepEqual(access.reasons, ["provider-shape", "credential-key", "paired-field"]);
+  assert.deepEqual(secret.reasons, ["provider-shape", "credential-key", "paired-field"]);
+
+  const cloudflare = [
+    `CLOUDFLARE_API_TOKEN=${CF_API_TOKEN}`,
+    "CF_ACCOUNT_ID=account",
+    `CLOUDFLARE_API_KEY=${CF_GLOBAL_KEY}`
+  ].join("\n");
+  const cfFindings = scanText("cf.env", cloudflare, opts);
+  const cfToken = findingById(cfFindings, "cloudflare-api-token");
+  const cfGlobal = findingById(cfFindings, "cloudflare-global-api-key");
+  assert.equal(cfToken.line, 1);
+  assert.equal(cfGlobal.line, 3);
+  assert.deepEqual(cfToken.reasons, ["provider-shape", "credential-key", "paired-field"]);
+  assert.deepEqual(cfGlobal.reasons, ["provider-shape", "credential-key", "paired-field"]);
+
+  const datadog = [`DD_API_KEY=${DD_API_KEY}`, `DD_APP_KEY=${DD_APP_KEY}`].join("\n");
+  const ddFindings = scanText("dd.env", datadog, opts);
+  const ddApi = findingById(ddFindings, "datadog-api-key");
+  const ddApp = findingById(ddFindings, "datadog-app-key");
+  assert.equal(ddApi.line, 1);
+  assert.equal(ddApp.line, 2);
+  assert.deepEqual(ddApi.reasons, ["provider-shape", "credential-key", "paired-field"]);
+  assert.deepEqual(ddApp.reasons, ["provider-shape", "credential-key", "paired-field"]);
+
+  const algolia = [`ALGOLIA_APP_ID=${ALGOLIA_APP_ID}`, `ALGOLIA_API_KEY=${ALGOLIA_ADMIN_KEY}`].join("\n");
+  const algoliaKey = findingById(scanText("algolia.env", algolia, opts), "algolia-api-key");
+  assert.equal(algoliaKey.file, "algolia.env");
+  assert.equal(algoliaKey.line, 2);
+  assert.deepEqual(algoliaKey.reasons, ["provider-shape", "credential-key", "paired-field"]);
+
+  const discord = [`DISCORD_BOT_TOKEN=${DISCORD_BOT}`, "DISCORD_CLIENT_SECRET=placeholder"].join("\n");
+  const bot = findingById(scanText("discord.env", discord, opts), "discord-bot-token");
+  assert.equal(bot.line, 1);
+  assert.equal(bot.status, "structurally-plausible");
+  assert.deepEqual(bot.reasons, ["provider-shape", "credential-key", "paired-field"]);
+});
+
+test("issue #129: a value on the line below its key keeps that line", () => {
+  const text = ["CLOUDFLARE_API_TOKEN:", CF_API_TOKEN].join("\n");
+  const token = findingById(scanText("cf.yml", text, opts), "cloudflare-api-token");
+  assert.equal(token.line, 2);
+  assert.equal(token.file, "cf.yml");
+  assert.deepEqual(token.reasons, ["provider-shape", "credential-key"]);
+});
+
+test("issue #129: a lookalike with no credential context is not a composite hit", () => {
+  const lookalikes = [
+    `const digest = "${AWS_SECRET_ACCESS_KEY}";`,
+    `const token = "${CF_API_TOKEN}";`,
+    `const hash = "${DD_API_KEY}";`,
+    `rev ${DD_APP_KEY}`,
+    "datadog client\n" + `rev ${DD_APP_KEY}`,
+    `const id = "${ALGOLIA_ADMIN_KEY}";`,
+    `const bot = "${DISCORD_BOT}";`,
+    `const globalKey = "${CF_GLOBAL_KEY}";`
+  ];
+  for (const text of lookalikes) {
+    const hits = scanText("lookalike.txt", text, opts).filter((finding) => COMPOSITE_IDS.includes(finding.ruleId));
+    assert.deepEqual(hits, [], text);
+  }
+});
+
+test("issue #129: an incomplete pair still reports the prefix or keyed field", () => {
+  const accessOnly = scanText("a.env", AWS_ACCESS_KEY, opts);
+  const access = findingById(accessOnly, "aws-access-key-id");
+  assert.equal(access.line, 1);
+  assert.deepEqual(access.reasons, ["provider-shape"]);
+  assert.equal(accessOnly.some((finding) => finding.ruleId === "aws-secret-access-key"), false);
+
+  const ddOnly = findingById(scanText("dd.env", `DD_API_KEY=${DD_API_KEY}`, opts), "datadog-api-key");
+  assert.deepEqual(ddOnly.reasons, ["provider-shape", "credential-key"]);
+  assert.equal(ddOnly.status, "structurally-plausible");
+
+  const discordOnly = findingById(scanText("discord.env", `DISCORD_BOT_TOKEN=${DISCORD_BOT}`, opts), "discord-bot-token");
+  assert.deepEqual(discordOnly.reasons, ["provider-shape", "credential-key"]);
+});
+
+test("issue #129: the pair window is a fixed line radius and stays on the original line", () => {
+  const inside = [AWS_ACCESS_KEY, ...gap(COMPOSITE_WINDOW_LINES - 1), AWS_SECRET_ACCESS_KEY].join("\n");
+  const insideFindings = scanText("near.env", inside, opts);
+  const insideSecret = findingById(insideFindings, "aws-secret-access-key");
+  assert.equal(insideSecret.line, COMPOSITE_WINDOW_LINES + 1);
+  assert.equal(insideSecret.file, "near.env");
+  assert.deepEqual(insideSecret.reasons, ["provider-shape", "paired-field"]);
+  assert.deepEqual(findingById(insideFindings, "aws-access-key-id").reasons, ["provider-shape", "paired-field"]);
+
+  const outside = [AWS_ACCESS_KEY, ...gap(COMPOSITE_WINDOW_LINES), AWS_SECRET_ACCESS_KEY].join("\n");
+  const outsideFindings = scanText("far.env", outside, opts);
+  assert.equal(outsideFindings.some((finding) => finding.ruleId === "aws-secret-access-key"), false);
+  const outsideAccess = findingById(outsideFindings, "aws-access-key-id");
+  assert.equal(outsideAccess.line, 1);
+  assert.deepEqual(outsideAccess.reasons, ["provider-shape"]);
+
+  const reversed = [AWS_SECRET_ACCESS_KEY, ...gap(COMPOSITE_WINDOW_LINES - 1), AWS_ACCESS_KEY].join("\n");
+  const reversedFindings = scanText("rev.env", reversed, opts);
+  assert.equal(findingById(reversedFindings, "aws-secret-access-key").line, 1);
+  assert.equal(findingById(reversedFindings, "aws-access-key-id").line, COMPOSITE_WINDOW_LINES + 1);
+});
+
+test("issue #129: a failed structural check keeps the prefix hit and omits that reason", () => {
+  const malformed = findingById(scanText("bad.jwt", JWT_MALFORMED, opts), "jwt");
+  assert.equal(malformed.line, 1);
+  assert.equal(malformed.status, "structurally-plausible");
+  assert.deepEqual(malformed.reasons, ["provider-shape"]);
+  assert.equal(malformed.reasons.includes("structural-check"), false);
+
+  const wellFormed = findingById(scanText("ok.jwt", JWT_WELL_FORMED, opts), "jwt");
+  assert.deepEqual(wellFormed.reasons, ["provider-shape", "structural-check"]);
+
+  const azure = findingById(scanText("az.env", `AccountKey=${AZURE_ACCOUNT_KEY}`, opts), "azure-storage-key");
+  assert.deepEqual(azure.reasons, ["provider-shape", "structural-check"]);
+  assert.equal(azure.status, "structurally-plausible");
+});
+
+test("issue #129: offline checks never claim a credential works, and reports stay redacted", () => {
+  const text = [`aws_access_key_id=${AWS_ACCESS_KEY}`, `aws_secret_access_key=${AWS_SECRET_ACCESS_KEY}`].join("\n");
+  const findings = scanText("creds.env", text, opts);
+  for (const finding of findings) {
+    assert.equal(finding.status, "structurally-plausible");
+    assert.equal(Object.hasOwn(finding, "verified"), false);
+    for (const reason of finding.reasons) assert.ok(CONFIDENCE_REASONS.includes(reason));
+  }
+  const report = formatReport({ findings });
+  const history = formatHistoryReport({
+    ok: true,
+    empty: false,
+    findings: findings.map((finding) => ({
+      ...finding,
+      commit: { sha: "a".repeat(40), index: 0, time: Date.UTC(2026, 0, 2) },
+      inHead: true
+    })),
+    scannedCount: 1,
+    commitCount: 1,
+    scope: "HEAD",
+    allowlistedCount: 0,
+    oversized: [],
+    unavailableCount: 0,
+    shallow: false
+  });
+  for (const rendered of [report, history]) {
+    assert.equal(rendered.includes(AWS_SECRET_ACCESS_KEY), false);
+    assert.equal(rendered.includes(AWS_ACCESS_KEY), false);
+    assert.match(rendered, /structurally-plausible: provider-shape, credential-key, paired-field/);
+    assert.match(rendered, /Potential|potential/);
+    assert.doesNotMatch(rendered, /verified/i);
+  }
+  assert.match(report, /creds\.env/);
+  assert.match(history, /creds\.env:2/);
+  assert.match(history, /aws-secret-access-key/);
+});
+
+test("issue #129: a missing pair does not drop generic or prefix findings", () => {
+  const generic = findingById(scanText("config.txt", "DB_PASS=psspl@443e", opts), "generic-secret-assignment");
+  assert.deepEqual(generic.reasons, ["credential-key"]);
+  assert.equal(generic.status, "structurally-plausible");
+
+  const entropy = findingById(scanText("a.ts", 'x = "Zx9Kq2mVbN7pLwR4tYaSdFgHjKlPoIuY"', opts), "high-entropy-string");
+  assert.deepEqual(entropy.reasons, []);
+  assert.equal(entropy.status, "structurally-plausible");
+});
+
+test("issue #129: composite rule ids are reserved and a custom rule is not dropped", () => {
+  const { rules, errors } = parseCustomRules(JSON.stringify({
+    rules: COMPOSITE_IDS.map((id) => ({ id, description: "impostor", regex: "never-matches" }))
+  }));
+  assert.deepEqual(rules, []);
+  assert.equal(errors.length, COMPOSITE_IDS.length);
+  for (const error of errors) assert.match(error, /already used by a built-in rule/);
+
+  const custom = scanText("a.js", "acme_abcdefghijklmnopqrstuvwxyz012345", {
+    ...opts,
+    customRules: [{ id: "acme-internal-token", description: "ACME internal service token", regex: /acme_[a-z0-9]{20}/ }]
+  });
+  const hit = findingById(custom, "acme-internal-token");
+  assert.equal(hit.status, "structurally-plausible");
+  assert.deepEqual(hit.reasons, []);
+});
+
+test("issue #129: fixture recall, precision, and bounded scan latency", () => {
+  const tracked = new Set([...COMPOSITE_IDS, "aws-access-key-id", "jwt", "azure-storage-key"]);
+  const cases = [
+    { file: "pair.env", text: `aws_access_key_id=${AWS_ACCESS_KEY}\naws_secret_access_key=${AWS_SECRET_ACCESS_KEY}`, want: ["aws-access-key-id", "aws-secret-access-key"] },
+    { file: "id.env", text: AWS_ACCESS_KEY, want: ["aws-access-key-id"] },
+    { file: "secret.env", text: `const digest = "${AWS_SECRET_ACCESS_KEY}";`, want: [] },
+    { file: "far.env", text: [AWS_ACCESS_KEY, ...gap(COMPOSITE_WINDOW_LINES), AWS_SECRET_ACCESS_KEY].join("\n"), want: ["aws-access-key-id"] },
+    { file: "cf.env", text: `CLOUDFLARE_API_TOKEN=${CF_API_TOKEN}`, want: ["cloudflare-api-token"] },
+    { file: "cf-bare.txt", text: CF_API_TOKEN, want: [] },
+    { file: "cf-global.env", text: `CLOUDFLARE_API_KEY=${CF_GLOBAL_KEY}`, want: ["cloudflare-global-api-key"] },
+    { file: "dd.env", text: `DD_API_KEY=${DD_API_KEY}\nDD_APP_KEY=${DD_APP_KEY}`, want: ["datadog-api-key", "datadog-app-key"] },
+    { file: "dd-one.env", text: `DD_API_KEY=${DD_API_KEY}`, want: ["datadog-api-key"] },
+    { file: "dd-bare.txt", text: DD_APP_KEY, want: [] },
+    { file: "dd-sha.txt", text: `datadog client\nrev ${DD_APP_KEY}`, want: [] },
+    { file: "al.env", text: `ALGOLIA_APP_ID=${ALGOLIA_APP_ID}\nALGOLIA_API_KEY=${ALGOLIA_ADMIN_KEY}`, want: ["algolia-api-key"] },
+    { file: "al-one.env", text: `ALGOLIA_API_KEY=${ALGOLIA_ADMIN_KEY}`, want: ["algolia-api-key"] },
+    { file: "al-bare.txt", text: ALGOLIA_ADMIN_KEY, want: [] },
+    { file: "bot.env", text: `DISCORD_BOT_TOKEN=${DISCORD_BOT}\nDISCORD_CLIENT_SECRET=placeholder`, want: ["discord-bot-token"] },
+    { file: "bot-bare.txt", text: DISCORD_BOT, want: [] },
+    { file: "ok.jwt", text: JWT_WELL_FORMED, want: ["jwt"], structuralRule: "jwt", structural: true },
+    { file: "bad.jwt", text: JWT_MALFORMED, want: ["jwt"], structuralRule: "jwt", structural: false },
+    { file: "az.env", text: `AccountKey=${AZURE_ACCOUNT_KEY}`, want: ["azure-storage-key"], structuralRule: "azure-storage-key", structural: true }
+  ];
+
+  let tp = 0;
+  let fp = 0;
+  let fn = 0;
+  for (const sample of cases) {
+    const findings = scanText(sample.file, sample.text, opts);
+    const got = new Set(findings.map((finding) => finding.ruleId).filter((id) => tracked.has(id)));
+    for (const id of sample.want) {
+      if (got.has(id)) tp += 1;
+      else fn += 1;
+    }
+    for (const id of got) {
+      if (!sample.want.includes(id)) fp += 1;
+    }
+    if (sample.structuralRule) {
+      const hit = findings.find((finding) => finding.ruleId === sample.structuralRule);
+      const hasStructural = Boolean(hit?.reasons?.includes("structural-check"));
+      if (hasStructural === sample.structural) tp += 1;
+      else if (sample.structural) fn += 1;
+      else fp += 1;
+    }
+  }
+  const recall = tp / (tp + fn);
+  const precision = tp + fp === 0 ? 1 : tp / (tp + fp);
+  assert.equal(fn, 0, `false negatives ${fn}`);
+  assert.equal(fp, 0, `false positives ${fp}`);
+  assert.equal(tp, 18, `labeled hits ${tp}`);
+  assert.equal(recall, 1);
+  assert.equal(precision, 1);
+
+  const buriedAt = 6000;
+  const lines = [...gap(buriedAt), AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY, ...gap(buriedAt)];
+  const started = performance.now();
+  const buried = scanText("bulk.txt", lines.join("\n"), opts);
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 5000, `bounded scan took ${elapsed.toFixed(0)}ms`);
+  const buriedSecret = findingById(buried, "aws-secret-access-key");
+  assert.equal(buriedSecret.file, "bulk.txt");
+  assert.equal(buriedSecret.line, buriedAt + 2);
+  assert.equal(findingById(buried, "aws-access-key-id").line, buriedAt + 1);
 });
 
 // Materializes { "relative/path": "content" } under a fresh temp directory and

@@ -54,8 +54,8 @@ export function isHeuristicExemptPath(filePath, env = process.env) {
 // pre-commit hook without depending on the globally installed package (whose
 // path changes across Node/nvm versions).
 //
-// It never prints matched secret values — only file paths, line numbers, and
-// rule identifiers.
+// It never prints matched secret values — only file paths, line numbers,
+// rule identifiers, and fixed confidence reason codes.
 
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -131,9 +131,10 @@ export const PROVIDER_RULES = [
   // docs and build output, where the heuristic layers are deliberately quiet.
   // Providers whose credentials are a bare hex/base64 run with no prefix
   // (Cloudflare API tokens, Datadog and Algolia keys, Discord bot tokens) are
-  // left out on purpose: matching them on shape alone would flag every SHA and
-  // random id in the tree, and the generic/entropy layers already cover them
-  // when they appear next to a credential keyword (issue #95).
+  // not listed here: matching them on shape alone would flag every SHA and
+  // random id in the tree (issue #95). They are reported by the composite
+  // pass below, and only when a credential key or a documented sibling field
+  // sits inside the line window.
   { id: "vault-token", description: "HashiCorp Vault token", regex: /\bhv[sbr]\.[A-Za-z0-9_-]{24,}/ },
   { id: "atlassian-api-token", description: "Atlassian API token", regex: /\bATATT3[A-Za-z0-9_=-]{20,}/ },
   { id: "databricks-token", description: "Databricks personal access token", regex: /\bdapi[0-9a-f]{32}(?:-[0-9]+)?\b/ },
@@ -702,10 +703,24 @@ const CUSTOM_RULE_DESCRIPTION_MAX = 120;
 // stateful through lastIndex, so a rule carrying one would match on every
 // other line it could match on and silently miss the rest.
 const CUSTOM_RULE_FLAGS_RE = /^[imsu]*$/;
+// Paired-field rules. Not entries in PROVIDER_RULES: a prefix-less value is
+// only a finding when context inside the line window admits it (issue #129).
+const COMPOSITE_RULES = [
+  { id: "aws-secret-access-key", description: "AWS secret access key" },
+  { id: "cloudflare-api-token", description: "Cloudflare API token" },
+  { id: "cloudflare-global-api-key", description: "Cloudflare global API key" },
+  { id: "datadog-api-key", description: "Datadog API key" },
+  { id: "datadog-app-key", description: "Datadog application key" },
+  { id: "algolia-api-key", description: "Algolia API key" },
+  { id: "discord-bot-token", description: "Discord bot token" }
+];
+const COMPOSITE_RULE_BY_ID = new Map(COMPOSITE_RULES.map((rule) => [rule.id, rule]));
+
 // Rule ids that already mean something in a report. A pack reusing one would
 // make a finding's origin unreadable, so they are refused rather than renamed.
 const RESERVED_RULE_IDS = new Set([
   ...PROVIDER_RULES.map((rule) => rule.id),
+  ...COMPOSITE_RULES.map((rule) => rule.id),
   GENERIC_SECRET_RULE_ID,
   "twilio-auth-token",
   "high-entropy-string",
@@ -866,6 +881,315 @@ export function collectK8sSecretDataLines(lines) {
 }
 
 // ---------------------------------------------------------------------------
+// Offline confidence (issue #129).
+//
+// A finding is only ever `structurally-plausible`. Nothing in this pass talks
+// to a provider, and a structural check never means the credential works.
+// Reason codes are a closed set, printed as fixed labels so a report cannot
+// echo the matched value:
+//
+//   provider-shape     the value matches a known provider or document shape
+//   structural-check   a documented length, alphabet, or padding check passed
+//   credential-key     a credential key name sits inside the line window
+//   paired-field       a related field sits inside the line window
+//
+// Missing context omits the reason. It does not drop a hit the prefix rules
+// already emit. The composite rules below are the exception that proves the
+// point: they are new ids for shapes that are not safe to match alone, so
+// they are born only inside the window. One file, one forward index, a fixed
+// line radius — never another file and never another commit.
+// ---------------------------------------------------------------------------
+export const COMPOSITE_WINDOW_LINES = 20;
+export const CONFIDENCE_STATUS = "structurally-plausible";
+export const CONFIDENCE_REASONS = Object.freeze([
+  "provider-shape",
+  "structural-check",
+  "credential-key",
+  "paired-field"
+]);
+
+const PROVIDER_SHAPE_IDS = new Set([
+  ...PROVIDER_RULES.map((rule) => rule.id),
+  ...COMPOSITE_RULES.map((rule) => rule.id),
+  "gcp-service-account-key",
+  "k8s-secret-data"
+]);
+
+const AWS_ACCESS_KEY_RE = PROVIDER_RULES.find((rule) => rule.id === "aws-access-key-id").regex;
+const TWILIO_SID_RE = PROVIDER_RULES.find((rule) => rule.id === "twilio-api-key").regex;
+// Azure storage keys are 512 bits, so base64 is 86 characters plus "==".
+const AZURE_STORAGE_KEY_RE = /\bAccountKey=([A-Za-z0-9+/]{86}==)/;
+// JWT shape the prefix rule already describes: three base64url parts.
+const JWT_SHAPE_RE = /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/;
+// 40-character base64, excluding a bare hex SHA-1. "/" and "+" are the
+// standard alphabet; a pure hex run is a commit id, not a secret key.
+const AWS_SECRET_RE = /(?<![A-Za-z0-9/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g;
+const CF_TOKEN_RE = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40}(?![A-Za-z0-9_-])/g;
+const HEX_32_RE = /(?<![A-Za-z0-9])[0-9a-fA-F]{32}(?![A-Za-z0-9])/;
+const HEX_37_RE = /(?<![A-Za-z0-9])[0-9a-fA-F]{37}(?![A-Za-z0-9])/;
+const HEX_40_RE = /(?<![A-Za-z0-9])[0-9a-fA-F]{40}(?![A-Za-z0-9])/;
+const DISCORD_BOT_RE = /(?<![A-Za-z0-9_-])[MNO][A-Za-z0-9_-]{23,25}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}(?![A-Za-z0-9_-])/;
+const ALGOLIA_APP_ID_RE = /(?<![A-Za-z0-9])[A-Z0-9]{10}(?![A-Za-z0-9])/;
+// Key names, not prose glued onto another word. "_" counts as a boundary so
+// CLOUDFLARE_API_TOKEN still matches, and "notdiscord" does not.
+const CREDENTIAL_KEY_RE = /(?:^|[^A-Za-z0-9])(?:passwd|password|passphrase|pwd|secret(?:[_-]?key)?|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|auth(?:[_-]?token)?|bearer|token|credentials?)(?=$|[^A-Za-z0-9])/i;
+const CLOUDFLARE_CONTEXT_RE = /(?:^|[^A-Za-z0-9])(?:cloudflare|cf[_-]api[_-](?:token|key)|cf[_-]account[_-]id)(?:$|[^A-Za-z0-9])/i;
+const DATADOG_CONTEXT_RE = /(?:^|[^A-Za-z0-9])(?:datadog|dd[_-](?:api|app|application)[_-]key)(?:$|[^A-Za-z0-9])/i;
+const ALGOLIA_CONTEXT_RE = /(?:^|[^A-Za-z0-9])algolia(?:$|[^A-Za-z0-9])/i;
+const DISCORD_CONTEXT_RE = /(?:^|[^A-Za-z0-9])discord(?:$|[^A-Za-z0-9])/i;
+const TWILIO_WORD_RE = /(?:^|[^A-Za-z0-9])twilio(?:$|[^A-Za-z0-9])/i;
+
+const SIGNAL_KEYS = [
+  "credentialKey",
+  "awsAccess",
+  "awsSecret",
+  "cloudflare",
+  "cfToken",
+  "cfGlobal",
+  "cfAccount",
+  "datadog",
+  "ddApi",
+  "ddApp",
+  "algolia",
+  "algoliaKey",
+  "algoliaAppId",
+  "discord",
+  "discordToken",
+  "discordSibling",
+  "twilioWord",
+  "twilioSid"
+];
+
+const COMPOSITE_CONTEXT_KEY = {
+  "cloudflare-api-token": "cloudflare",
+  "cloudflare-global-api-key": "cloudflare",
+  "datadog-api-key": "datadog",
+  "datadog-app-key": "datadog",
+  "algolia-api-key": "algolia",
+  "discord-bot-token": "discord"
+};
+
+function lineHasBoundedToken(line, regex, accept) {
+  regex.lastIndex = 0;
+  let match;
+  while ((match = regex.exec(line))) {
+    if (accept(match[0])) return true;
+  }
+  return false;
+}
+
+function lineHasAwsSecret(line) {
+  return lineHasBoundedToken(line, AWS_SECRET_RE, (token) => (
+    !/^[0-9a-fA-F]{40}$/.test(token) && /[0-9+/]/.test(token)
+  ));
+}
+
+function lineHasCloudflareToken(line) {
+  // Pure hex is a Datadog application key or a SHA, not a Cloudflare token.
+  return lineHasBoundedToken(line, CF_TOKEN_RE, (token) => (
+    !/^[0-9a-fA-F]{40}$/.test(token) && /[0-9]/.test(token)
+  ));
+}
+
+function indexCompositeLine(line) {
+  const cloudflare = CLOUDFLARE_CONTEXT_RE.test(line);
+  const datadog = DATADOG_CONTEXT_RE.test(line);
+  const algolia = ALGOLIA_CONTEXT_RE.test(line);
+  const discord = DISCORD_CONTEXT_RE.test(line);
+  const hex32 = HEX_32_RE.test(line);
+  return {
+    blank: line.trim() === "",
+    assignment: /[:=]/.test(line),
+    credentialKey: CREDENTIAL_KEY_RE.test(line),
+    awsAccess: AWS_ACCESS_KEY_RE.test(line),
+    awsSecret: lineHasAwsSecret(line),
+    cloudflare,
+    cfToken: lineHasCloudflareToken(line),
+    cfGlobal: HEX_37_RE.test(line),
+    cfAccount: /(?:^|[^A-Za-z0-9])cf[_-]account[_-]id(?:$|[^A-Za-z0-9])/i.test(line),
+    datadog,
+    ddApi: hex32,
+    ddApp: HEX_40_RE.test(line),
+    algolia,
+    algoliaKey: hex32,
+    algoliaAppId: algolia && /app[_-]?id/i.test(line) && ALGOLIA_APP_ID_RE.test(line),
+    discord,
+    discordToken: DISCORD_BOT_RE.test(line),
+    discordSibling: discord && /(?:^|[^A-Za-z0-9])client[_-](?:id|secret)(?:$|[^A-Za-z0-9])/i.test(line),
+    twilioWord: TWILIO_WORD_RE.test(line),
+    twilioSid: TWILIO_SID_RE.test(line)
+  };
+}
+
+// One forward pass. Later correlation is a prefix-sum lookup over a fixed
+// radius, so the work stays linear in the number of lines.
+function indexCompositeLines(lines) {
+  const signals = lines.map(indexCompositeLine);
+  const sums = {};
+  for (const key of SIGNAL_KEYS) {
+    const arr = new Array(signals.length + 1).fill(0);
+    for (let i = 0; i < signals.length; i += 1) arr[i + 1] = arr[i] + (signals[i][key] ? 1 : 0);
+    sums[key] = arr;
+  }
+  return { signals, sums };
+}
+
+function windowCount(sums, key, index, length) {
+  const lo = Math.max(0, index - COMPOSITE_WINDOW_LINES);
+  const hi = Math.min(length - 1, index + COMPOSITE_WINDOW_LINES);
+  const arr = sums[key];
+  return arr[hi + 1] - arr[lo];
+}
+
+function nearestPrevious(signals, index) {
+  for (let i = index - 1; i >= 0 && index - i <= 3; i -= 1) {
+    if (!signals[i].blank) return signals[i];
+  }
+  return null;
+}
+
+// A prefix-less value is admitted by a credential key in the window, not by
+// length alone. The key has to name this value: it sits on the same line, the
+// line is itself a credential assignment, or the key is the line just above.
+// A commit SHA merely near the word "datadog" is not a Datadog application key.
+function prefixlessAdmitted(signals, sums, index, contextKey) {
+  const n = signals.length;
+  if (windowCount(sums, contextKey, index, n) === 0) return false;
+  const here = signals[index];
+  if (here[contextKey] || here.credentialKey) return true;
+  const previous = nearestPrevious(signals, index);
+  return Boolean(previous && previous[contextKey] && previous.assignment);
+}
+
+function windowHasAdmitted(signals, sums, index, contextKey, candidateKey) {
+  const n = signals.length;
+  const lo = Math.max(0, index - COMPOSITE_WINDOW_LINES);
+  const hi = Math.min(n - 1, index + COMPOSITE_WINDOW_LINES);
+  for (let i = lo; i <= hi; i += 1) {
+    if (signals[i][candidateKey] && prefixlessAdmitted(signals, sums, i, contextKey)) return true;
+  }
+  return false;
+}
+
+function compositeRuleIdsForLine(signals, sums, index) {
+  const ids = [];
+  const n = signals.length;
+  const here = signals[index];
+  if (here.awsSecret && windowCount(sums, "awsAccess", index, n) > 0) ids.push("aws-secret-access-key");
+  if (here.cfToken && prefixlessAdmitted(signals, sums, index, "cloudflare")) ids.push("cloudflare-api-token");
+  if (here.cfGlobal && prefixlessAdmitted(signals, sums, index, "cloudflare")) ids.push("cloudflare-global-api-key");
+  if (here.ddApi && prefixlessAdmitted(signals, sums, index, "datadog")) ids.push("datadog-api-key");
+  if (here.ddApp && prefixlessAdmitted(signals, sums, index, "datadog")) ids.push("datadog-app-key");
+  if (here.algoliaKey && prefixlessAdmitted(signals, sums, index, "algolia")) ids.push("algolia-api-key");
+  if (here.discordToken && prefixlessAdmitted(signals, sums, index, "discord")) ids.push("discord-bot-token");
+  return ids;
+}
+
+function azureStorageKeyStructurallyValid(line) {
+  const match = line.match(AZURE_STORAGE_KEY_RE);
+  if (!match) return false;
+  const body = match[1];
+  const decoded = Buffer.from(body, "base64");
+  // 86 characters plus "==" is the encoding of exactly 64 bytes. Re-encoding
+  // rejects a string the decoder had to repair.
+  return decoded.length === 64 && decoded.toString("base64") === body;
+}
+
+function jwtStructurallyValid(line) {
+  const match = line.match(JWT_SHAPE_RE);
+  if (!match) return false;
+  const parts = match[0].split(".");
+  // Three parts, and each part's length is a legal unpadded base64url length.
+  // Length mod 4 === 1 cannot be base64; the prefix regex does not check it.
+  if (parts.length !== 3) return false;
+  return parts.every((part) => part.length >= 10 && part.length % 4 !== 1 && /^[A-Za-z0-9_-]+$/.test(part));
+}
+
+function hasPairedField(ruleId, line, index, signals, sums) {
+  const n = signals.length;
+  const near = (key) => windowCount(sums, key, index, n) > 0;
+  switch (ruleId) {
+    case "aws-access-key-id":
+      return near("awsSecret");
+    case "aws-secret-access-key":
+      return near("awsAccess");
+    case "cloudflare-api-token":
+      return windowHasAdmitted(signals, sums, index, "cloudflare", "cfGlobal") || near("cfAccount");
+    case "cloudflare-global-api-key":
+      return windowHasAdmitted(signals, sums, index, "cloudflare", "cfToken") || near("cfAccount");
+    case "datadog-api-key":
+      return windowHasAdmitted(signals, sums, index, "datadog", "ddApp");
+    case "datadog-app-key":
+      return windowHasAdmitted(signals, sums, index, "datadog", "ddApi");
+    case "algolia-api-key":
+      return near("algoliaAppId");
+    case "discord-bot-token":
+      return near("discordSibling");
+    case "gcp-service-account-key":
+    case "k8s-secret-data":
+      return true;
+    case "twilio-auth-token":
+      return near("twilioSid");
+    case "vonage-api-secret":
+      return /new\s+Vonage\s*\(/i.test(line);
+    default:
+      return false;
+  }
+}
+
+function hasCredentialKey(ruleId, index, signals, sums) {
+  if (ruleId === GENERIC_SECRET_RULE_ID) return true;
+  const n = signals.length;
+  if (windowCount(sums, "credentialKey", index, n) > 0) return true;
+  if (ruleId === "twilio-auth-token" && windowCount(sums, "twilioWord", index, n) > 0) return true;
+  const contextKey = COMPOSITE_CONTEXT_KEY[ruleId];
+  return Boolean(contextKey && windowCount(sums, contextKey, index, n) > 0);
+}
+
+function orderedReasons(reasons) {
+  const present = new Set(reasons);
+  return CONFIDENCE_REASONS.filter((reason) => present.has(reason));
+}
+
+function confidenceForFinding(finding, lines, indexed) {
+  const lineIndex = Math.max(0, (finding.line || 1) - 1);
+  const line = lines[lineIndex] ?? "";
+  const reasons = [];
+  if (PROVIDER_SHAPE_IDS.has(finding.ruleId)) reasons.push("provider-shape");
+  if (finding.ruleId === "azure-storage-key" && azureStorageKeyStructurallyValid(line)) {
+    reasons.push("structural-check");
+  }
+  if (finding.ruleId === "jwt" && jwtStructurallyValid(line)) reasons.push("structural-check");
+  if (indexed && hasCredentialKey(finding.ruleId, lineIndex, indexed.signals, indexed.sums)) {
+    reasons.push("credential-key");
+  }
+  if (indexed && hasPairedField(finding.ruleId, line, lineIndex, indexed.signals, indexed.sums)) {
+    reasons.push("paired-field");
+  }
+  return orderedReasons(reasons);
+}
+
+function withConfidence(finding, reasons = []) {
+  return {
+    ...finding,
+    status: CONFIDENCE_STATUS,
+    reasons: orderedReasons(reasons)
+  };
+}
+
+// Fixed labels only. Unknown text is dropped rather than printed: the reason
+// slot must not become a place a matched value can leak.
+export function formatFindingConfidence(finding) {
+  if (!finding) return "";
+  const reasons = orderedReasons(Array.isArray(finding.reasons) ? finding.reasons : []);
+  const status = finding.status === CONFIDENCE_STATUS ? CONFIDENCE_STATUS : "";
+  if (status && reasons.length > 0) return `  ${status}: ${reasons.join(", ")}`;
+  if (status) return `  ${status}`;
+  if (reasons.length > 0) return `  ${reasons.join(", ")}`;
+  return "";
+}
+
+// ---------------------------------------------------------------------------
 // Core text scanner.
 // ---------------------------------------------------------------------------
 export function scanText(filePath, content, options = {}) {
@@ -900,7 +1224,9 @@ export function scanText(filePath, content, options = {}) {
   // rather than as a running flag, for two reasons a sequential scan gets
   // wrong - see collectK8sSecretDataLines.
   const k8sSecretDataLines = collectK8sSecretDataLines(lines);
-
+  // Indexed once, up front, so pairing never walks the file again.
+  const indexed = indexCompositeLines(lines);
+  const { signals, sums } = indexed;
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
@@ -984,9 +1310,14 @@ export function scanText(filePath, content, options = {}) {
         description: "high-entropy string with no recognizable name"
       });
     }
+
+    for (const ruleId of compositeRuleIdsForLine(signals, sums, i)) {
+      const rule = COMPOSITE_RULE_BY_ID.get(ruleId);
+      findings.push({ file: filePath, line: lineNumber, ruleId: rule.id, description: rule.description });
+    }
   }
 
-  return findings;
+  return findings.map((finding) => withConfidence(finding, confidenceForFinding(finding, lines, indexed)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,7 +1640,7 @@ export function scanFileContent(file, content, options = {}) {
 
   const fileRule = matchFilenameRule(file);
   if (fileRule) {
-    findings.push({ file, line: 0, ruleId: fileRule.id, description: fileRule.description });
+    findings.push(withConfidence({ file, line: 0, ruleId: fileRule.id, description: fileRule.description }));
   }
   if (content === null || content === undefined) return findings;
 
@@ -1317,12 +1648,12 @@ export function scanFileContent(file, content, options = {}) {
   for (const secret of dotenvSecrets) {
     const index = findWordBoundaryIndex(content, secret);
     if (index !== -1) {
-      findings.push({
+      findings.push(withConfidence({
         file,
         line: content.slice(0, index).split(/\r?\n/).length,
         ruleId: "hardcoded-dotenv-secret",
         description: "a secret value from a .env file is hardcoded here"
-      });
+      }));
       break; // one is enough to block; do not enumerate values
     }
   }
@@ -1397,7 +1728,7 @@ export function formatReport({ findings, gitleaks }, options = {}) {
     lines.push(`  ${c.bold(file)}`);
     for (const f of fileFindings) {
       const where = f.line > 0 ? `line ${f.line}` : "file";
-      lines.push(`    ${c.red("✗")} ${c.yellow(`[${f.ruleId}]`)} ${f.description} (${where})`);
+      lines.push(`    ${c.red("✗")} ${c.yellow(`[${f.ruleId}]`)} ${f.description} (${where})${formatFindingConfidence(f)}`);
     }
   }
 

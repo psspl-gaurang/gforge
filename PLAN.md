@@ -43,6 +43,7 @@ installed as `~/.gforge/hooks/gforge-scan.mjs`):
 - Allowlist via `.gforgeignore` and inline `gforge:allow`.
 - Optional gitleaks pass merged in when the binary is present.
 - Redacted output (never prints matched values); fails closed on scan errors.
+- Offline confidence only (`structurally-plausible`; reasons `provider-shape`, `structural-check`, `credential-key`, `paired-field`) and a 20-line single-file composite pass for AWS secret keys and prefix-less Cloudflare, Datadog, Algolia, and Discord shapes. A missing pair never drops an existing hit, and an offline check never claims a credential is active.
 
 ## Next Work
 

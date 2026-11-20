@@ -41,8 +41,8 @@ so the standard is enforced by default, not by discipline.
   - **Entropy** — high-entropy strings that carry no recognizable name.
 - **Low noise by design.** References like `process.env.DB_PASSWORD`, placeholders,
   and env templates (`.env.example`) are not flagged, so correct code keeps flowing.
-- **Never leaks the secret.** Reports only file paths, line numbers, and rule names —
-  the matched value is never printed.
+- **Never leaks the secret.** Reports only file paths, line numbers, rule names,
+  and fixed confidence reason codes — the matched value is never printed.
 - **Encoding-aware.** Handles UTF‑8, UTF‑16, and BOM-prefixed files (e.g. those
   written by PowerShell) so nothing slips through as "binary".
 - **Zero-config upkeep.** Self-installing on `npm i -g`, self-upgrading, and
@@ -146,9 +146,13 @@ value**. Detection runs several layers in order:
    HashiCorp Vault, Atlassian, Databricks, Grafana, Linear, Supabase, New Relic,
    Sentry, Fly.io, Terraform Cloud, Postman, private keys, JWTs, and Kubernetes
    `Secret` manifests. Every rule anchors on a literal vendor prefix or document
-   shape, so providers whose credentials are a bare hex or base64 run with no
-   prefix are deliberately left to layers 3 and 4 rather than matched on length
-   alone. Add your own formats with [custom rules](#custom-rule-packs).
+   shape. Providers whose credentials are a bare hex or base64 run with no
+   prefix — Cloudflare API tokens and global keys, Datadog API and application
+   keys, Algolia API keys, and Discord bot tokens — are reported only when a
+   credential key or a documented sibling field sits within 20 lines. An AWS
+   secret access key is reported only within 20 lines of an access key ID; the
+   access key ID is still reported on its own. Add your own formats with
+   [custom rules](#custom-rule-packs).
 3. **Generic secrets** — credential keywords assigned to a hardcoded value; smart
    enough to ignore `process.env.*`, function calls, `${VAR}` interpolation, and
    obvious placeholders.
@@ -162,6 +166,26 @@ value**. Detection runs several layers in order:
    keystores, `.git-credentials`, `.netrc`, and more.
 
 Detection is best-effort and complements — not replaces — good secret hygiene.
+Nothing is sent to a provider. A hit is **structurally plausible** only: an
+offline check never means the credential works.
+
+### Confidence reasons
+
+Each content finding carries `status: structurally-plausible` and zero or more
+reason codes. The codes are a closed set, printed as fixed labels, and they
+never include the matched value:
+
+| Code | Means |
+| --- | --- |
+| `provider-shape` | the value matches a known provider or document shape |
+| `structural-check` | a documented length, alphabet, or padding check passed (an Azure storage key decodes to 64 bytes; a JWT has three base64url parts whose lengths are legal) |
+| `credential-key` | a credential key name is within 20 lines |
+| `paired-field` | a related field is within 20 lines |
+
+Correlation looks at one file, walks it once, and attributes the hit to the
+matched field's own line. A missing pair, a missing key, or a failed structural
+check leaves the finding in place and simply omits that reason. Any finding
+still blocks the commit.
 
 ### Paths the heuristic layers skip
 

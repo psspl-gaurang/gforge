@@ -15,6 +15,7 @@ import { spawnSync } from "node:child_process";
 
 import {
   decodeBlob,
+  formatFindingConfidence,
   isPathAllowlisted,
   loadAllowlist,
   loadCustomRules,
@@ -316,7 +317,7 @@ export function formatHistoryReport(result) {
       lines.push(`  ${sha.slice(0, 12)}  ${date}`);
       for (const f of findings) {
         const where = f.line > 0 ? `${f.file}:${f.line}` : f.file;
-        lines.push(`    ✗ ${where}  [${f.ruleId}] ${f.description}${f.inHead ? "  (still in HEAD)" : ""}`);
+        lines.push(`    ✗ ${where}  [${f.ruleId}] ${f.description}${formatFindingConfidence(f)}${f.inHead ? "  (still in HEAD)" : ""}`);
       }
       lines.push("");
     }
