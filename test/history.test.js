@@ -6,7 +6,15 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { runCli } from "../src/cli.js";
-import { HISTORY_MAX_BLOB_BYTES, chunkVersions, formatHistoryReport, scanHistory } from "../src/history.js";
+import {
+  HISTORY_INCOMPLETE_EXIT,
+  HISTORY_MAX_BLOB_BYTES,
+  chunkVersions,
+  formatHistoryReport,
+  historyExitCode,
+  isHistoryIncomplete,
+  scanHistory
+} from "../src/history.js";
 
 // ---------------------------------------------------------------------------
 // `gforge history` against real repositories (issue #88). Every git call here
@@ -415,6 +423,265 @@ test("issue #134: history is read in bounded runs, and the result matches an unb
   assert.deepEqual(ids(small), ids(baseline));
   assert.equal(baseline.findings.length > 0, true, "the leak is still attributed");
   assert.equal(small.findings[0].commit.sha, baseline.findings[0].commit.sha);
+});
+
+function memoryStreams() {
+  const out = { stdout: "", stderr: "" };
+  return {
+    out,
+    io: { stdout: { write: (s) => (out.stdout += s) }, stderr: { write: (s) => (out.stderr += s) } }
+  };
+}
+
+const cleanBanner = /GForge history scan - no secrets found/;
+
+function assertIncompleteReport(report) {
+  assert.doesNotMatch(report, cleanBanner);
+  assert.match(report, /GForge history scan incomplete/);
+  assert.match(report, /This scan does not assure that history is free of secrets/);
+}
+
+// ---------------------------------------------------------------------------
+// Incomplete scans are not a clean success (issue #126). Allowlist skips are
+// approved exceptions. Missing objects, over-limit blobs, shallow history,
+// and invalid custom rules are unexpected omissions.
+// ---------------------------------------------------------------------------
+test("issue #126: history status treats only unexpected omissions as incomplete", () => {
+  const base = {
+    ok: true,
+    findings: [],
+    unavailableCount: 0,
+    oversized: [],
+    shallow: false,
+    customRuleErrors: [],
+    allowlistedCount: 0
+  };
+  assert.equal(isHistoryIncomplete(base), false);
+  assert.equal(historyExitCode(base), 0);
+  assert.equal(historyExitCode({ ...base, allowlistedCount: 4 }), 0);
+  assert.equal(isHistoryIncomplete({ ...base, allowlistedCount: 4 }), false);
+
+  for (const patch of [
+    { unavailableCount: 1 },
+    { oversized: [{ path: "dump.sql" }] },
+    { shallow: true },
+    { customRuleErrors: ["bad"] }
+  ]) {
+    const result = { ...base, ...patch };
+    assert.equal(isHistoryIncomplete(result), true, JSON.stringify(patch));
+    assert.equal(historyExitCode(result), HISTORY_INCOMPLETE_EXIT);
+    assert.equal(historyExitCode(result, { allowIncomplete: true }), 0);
+    const withFinding = { ...result, findings: [{ file: "a.txt" }] };
+    assert.equal(historyExitCode(withFinding), 1);
+    assert.equal(historyExitCode(withFinding, { allowIncomplete: true }), 1);
+  }
+
+  assert.equal(historyExitCode({ ok: false, error: "not inside a git repository" }), 1);
+  assert.equal(historyExitCode({ ...base, empty: true }), 0);
+});
+
+test("issue #126: an incomplete report separates approved skips and does not read as a clean scan", () => {
+  const marker = "RULEPACK_MARKER_NOT_A_SECRET";
+  const report = formatHistoryReport({
+    ok: true,
+    scope: "HEAD",
+    commitCount: 3,
+    scannedCount: 1,
+    findings: [],
+    allowlistedCount: 2,
+    oversized: [{ path: "dump.sql", size: 11 * 1024 * 1024, commit: { sha: "abcdef1234567890", time: 0 } }],
+    unavailableCount: 1,
+    shallow: true,
+    customRuleErrors: [`"${marker}": id must be 2-40 characters of lowercase letters, digits and hyphens`]
+  });
+
+  assertIncompleteReport(report);
+  assert.match(report, /Approved exceptions:/);
+  assert.match(report, /Not scanned:/);
+  assert.match(report, /2 file versions skipped by \.gforgeignore\/\.gitleaksignore - rerun with --no-allowlist/);
+  assert.match(report, /1 file version over 10 MB not scanned: dump\.sql @ abcdef123456 \(11\.0 MB\)/);
+  assert.match(report, /1 file version not available locally \(a partial clone\)/);
+  assert.match(report, /shallow clone, so history older than its depth was not scanned/);
+  assert.match(report, /1 invalid custom rule in ~\/\.gforge\/rules\.json ignored/);
+  assert.equal(report.includes(marker), false, "a rule error must not be printed");
+
+  const approvedAt = report.indexOf("Approved exceptions:");
+  const omittedAt = report.indexOf("Not scanned:");
+  const allowLine = report.indexOf("skipped by .gforgeignore");
+  assert.ok(approvedAt !== -1 && allowLine > approvedAt && allowLine < omittedAt);
+});
+
+test("issue #126: an allowlist skip and an inline marker stay a complete clean result", async () => {
+  const r = await makeRepo();
+  await r.write(".gforgeignore", "^fixtures/\n");
+  await r.write("fixtures/sample.txt", `${LEAK_OLD}\n`);
+  await r.write("inline.txt", `${LEAK_LIVE} # gforge:allow\n`);
+  await r.write("app.js", "export const x = 1;\n");
+  r.commit("init");
+
+  const result = r.scan();
+  assert.equal(result.findings.length, 0);
+  assert.equal(result.allowlistedCount, 1);
+  assert.equal(isHistoryIncomplete(result), false);
+  assert.equal(historyExitCode(result), 0);
+  const report = formatHistoryReport(result);
+  assert.match(report, cleanBanner);
+  assert.match(report, /Approved exceptions:/);
+  assert.doesNotMatch(report, /Not scanned:/);
+  assert.equal(report.includes(LEAK_OLD), false);
+  assert.equal(report.includes(LEAK_LIVE), false);
+
+  const io = memoryStreams();
+  assert.equal((await runCli(["history"], io.io, { cwd: r.repo, home: r.home })).exitCode, 0);
+  assert.match(io.out.stdout, cleanBanner);
+});
+
+test("issue #126: a branch with no commits, and --all with no refs, stay complete", async () => {
+  const r = await makeRepo();
+  const none = memoryStreams();
+  assert.equal((await runCli(["history"], none.io, { cwd: r.repo, home: r.home })).exitCode, 0);
+  assert.match(none.out.stdout, /no commits yet/);
+
+  const all = memoryStreams();
+  assert.equal((await runCli(["history", "--all"], all.io, { cwd: r.repo, home: r.home })).exitCode, 0);
+  assert.equal(isHistoryIncomplete(r.scan({ all: true })), false);
+  assert.match(all.out.stdout, cleanBanner);
+});
+
+test("issue #126: over-limit content is an incomplete scan, and findings still exit 1", async () => {
+  const r = await makeRepo();
+  await r.write("dump.sql", Buffer.alloc(HISTORY_MAX_BLOB_BYTES + 1, 0x41));
+  await r.write("app.js", "export const x = 1;\n");
+  r.commit("big");
+
+  const capped = r.scan();
+  assert.equal(capped.findings.length, 0);
+  assert.equal(capped.oversized.length, 1);
+  assert.equal(isHistoryIncomplete(capped), true);
+  assertIncompleteReport(formatHistoryReport(capped));
+  assert.equal(formatHistoryReport(capped).includes("A".repeat(64)), false, "blob bytes stay out of the report");
+
+  const quiet = memoryStreams();
+  assert.equal((await runCli(["history"], quiet.io, { cwd: r.repo, home: r.home })).exitCode, HISTORY_INCOMPLETE_EXIT);
+  assertIncompleteReport(quiet.out.stdout);
+  assert.equal(quiet.out.stderr, "");
+
+  const opted = memoryStreams();
+  const optedRun = await runCli(["history", "--allow-incomplete"], opted.io, { cwd: r.repo, home: r.home });
+  assert.equal(optedRun.exitCode, 0);
+  assertIncompleteReport(opted.out.stdout);
+
+  await r.write("a.txt", `${LEAK_OLD}\n`);
+  r.commit("leak");
+  const both = r.scan();
+  assert.ok(both.findings.length > 0);
+  assert.equal(isHistoryIncomplete(both), true);
+  const bothReport = formatHistoryReport(both);
+  assert.match(bothReport, /GForge history scan incomplete - .+ potential secret/);
+  assert.match(bothReport, /does not assure that history is free of secrets/);
+  assert.equal(bothReport.includes(LEAK_OLD), false);
+
+  const found = memoryStreams();
+  assert.equal((await runCli(["history", "--allow-incomplete"], found.io, { cwd: r.repo, home: r.home })).exitCode, 1);
+  assert.match(found.out.stdout, /potential secret/);
+});
+
+test("issue #126: unavailable objects are an incomplete scan, not a clean success", async () => {
+  const origin = await makeRepo();
+  origin.git(["config", "uploadpack.allowFilter", "true"]);
+  await origin.write("cfg.txt", "v1\n");
+  origin.commit("one");
+  await origin.write("cfg.txt", `${LEAK_OLD}\n`);
+  origin.commit("two");
+  await origin.write("cfg.txt", "v3\n");
+  origin.commit("three");
+
+  const clone = join(origin.root, "clone-status");
+  const cloned = spawnSync("git", ["clone", "-q", "--filter=blob:none", `file://${origin.repo}`, clone], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: join(origin.root, "gitconfig"), GIT_CONFIG_NOSYSTEM: "1" },
+    encoding: "utf8"
+  });
+  assert.equal(cloned.status, 0, cloned.stderr);
+
+  const result = scanHistory({ cwd: clone, home: origin.home, dotenvSecrets: [] });
+  assert.equal(result.ok, true);
+  assert.equal(result.findings.length, 0);
+  assert.ok(result.unavailableCount > 0);
+  assert.equal(isHistoryIncomplete(result), true);
+  const report = formatHistoryReport(result);
+  assertIncompleteReport(report);
+  assert.match(report, /not available locally \(a partial clone\)/);
+  assert.equal(report.includes(LEAK_OLD), false);
+
+  const io = memoryStreams();
+  assert.equal(
+    (await runCli(["history"], io.io, { cwd: clone, home: origin.home })).exitCode,
+    HISTORY_INCOMPLETE_EXIT
+  );
+  assertIncompleteReport(io.out.stdout);
+});
+
+test("issue #126: a shallow clone is an incomplete scan, not a clean success", async () => {
+  const origin = await makeRepo();
+  await origin.write("a.txt", `${LEAK_OLD}\n`);
+  origin.commit("one");
+  await origin.write("a.txt", "later\n");
+  origin.commit("two");
+
+  const clone = join(origin.root, "shallow-status");
+  const cloned = spawnSync("git", ["clone", "-q", "--depth", "1", `file://${origin.repo}`, clone], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: join(origin.root, "gitconfig"), GIT_CONFIG_NOSYSTEM: "1" },
+    encoding: "utf8"
+  });
+  assert.equal(cloned.status, 0, cloned.stderr);
+
+  const result = scanHistory({ cwd: clone, home: origin.home, dotenvSecrets: [] });
+  assert.equal(result.shallow, true);
+  assert.equal(result.findings.length, 0);
+  assert.equal(isHistoryIncomplete(result), true);
+  const report = formatHistoryReport(result);
+  assertIncompleteReport(report);
+  assert.match(report, /shallow clone, so history older than its depth was not scanned/);
+  assert.equal(report.includes(LEAK_OLD), false);
+
+  const io = memoryStreams();
+  assert.equal(
+    (await runCli(["history"], io.io, { cwd: clone, home: origin.home })).exitCode,
+    HISTORY_INCOMPLETE_EXIT
+  );
+  assertIncompleteReport(io.out.stdout);
+});
+
+test("issue #126: invalid custom rules are incomplete detection, and a missing pack is not", async () => {
+  const r = await makeRepo();
+  await r.write("app.js", "export const x = 1;\n");
+  r.commit("init");
+
+  const baseline = r.scan();
+  assert.deepEqual(baseline.customRuleErrors, []);
+  assert.equal(isHistoryIncomplete(baseline), false);
+  assert.equal(historyExitCode(baseline), 0);
+
+  const marker = "RULEPACK_MARKER_NOT_A_SECRET";
+  await mkdir(join(r.home, ".gforge"));
+  await writeFile(join(r.home, ".gforge", "rules.json"), `{ "rules": [{ "id": "${marker}" }] }\n`);
+
+  const result = r.scan();
+  assert.equal(result.ok, true);
+  assert.equal(result.findings.length, 0);
+  assert.ok(result.customRuleErrors.length > 0);
+  assert.equal(isHistoryIncomplete(result), true);
+  const report = formatHistoryReport(result);
+  assertIncompleteReport(report);
+  assert.match(report, /1 invalid custom rule in ~\/\.gforge\/rules\.json ignored/);
+  assert.equal(report.includes(marker), false);
+  assert.equal(report.includes(result.customRuleErrors[0]), false);
+
+  const io = memoryStreams();
+  assert.equal((await runCli(["history"], io.io, { cwd: r.repo, home: r.home })).exitCode, HISTORY_INCOMPLETE_EXIT);
+  assertIncompleteReport(io.out.stdout);
+  assert.equal(io.out.stdout.includes(marker), false);
+  assert.equal(io.out.stdout.includes(result.customRuleErrors[0]), false);
 });
 
 test("issue #134: chunkVersions bounds each run, keeps order, and isolates a blob over the limit", () => {

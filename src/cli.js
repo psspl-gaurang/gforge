@@ -14,7 +14,7 @@ import {
   performSelfUpgrade,
   readCachedUpdateNotice
 } from "./npm-update.js";
-import { formatHistoryReport, scanHistory } from "./history.js";
+import { formatHistoryReport, historyExitCode, scanHistory } from "./history.js";
 import { describeDotenvSources } from "./scanner.js";
 import { runSettingsCommand } from "./settings.js";
 import { createVerificationReport, formatVerificationReport } from "./verify.js";
@@ -68,10 +68,13 @@ export async function runCli(args, streams, options = {}) {
 }
 
 // Read-only: scans what is already committed, reports, and changes nothing.
-// Exits 1 when anything is found, so `gforge history` can gate a CI job.
+// Exit 0 is a complete scan with no findings. Exit 1 means findings, or the
+// scan could not run. Exit 2 means nothing matched but the scan was incomplete
+// (missing objects, over-limit blobs, shallow history, or invalid custom
+// rules), unless --allow-incomplete is set. Allowlisted paths stay complete.
 function runHistory(args, options, streams) {
   const flags = args.slice(1);
-  const known = ["--all", "--no-allowlist"];
+  const known = ["--all", "--no-allowlist", "--allow-incomplete"];
   const unknown = flags.filter((flag) => !known.includes(flag));
   if (unknown.length > 0) {
     streams.stderr.write(`GForge: unknown option for history: ${unknown.join(", ")}\n`);
@@ -90,7 +93,7 @@ function runHistory(args, options, streams) {
     return { exitCode: 1 };
   }
   streams.stdout.write(report);
-  return { exitCode: result.findings.length > 0 ? 1 : 0 };
+  return { exitCode: historyExitCode(result, { allowIncomplete: flags.includes("--allow-incomplete") }) };
 }
 
 // install/update first try to upgrade the globally installed package to the
@@ -234,7 +237,7 @@ function helpText(stream) {
     header("Commands:"),
     row("install", "Upgrade to the latest version (if any) and install the hooks"),
     row("verify", "Verify the environment and installed hooks (read-only)"),
-    row("history", "Scan this repo's commit history for secrets; --all, --no-allowlist"),
+    row("history", "Scan this repo's commit history for secrets; --all, --no-allowlist, --allow-incomplete"),
     row("update", "Upgrade to the latest version (if any) and refresh the hooks"),
     row("uninstall", "Remove GForge-owned hooks and restore your Git config"),
     row("settings", "Show settings; --no-autoupdate / --autoupdate (minor+major)"),

@@ -10,6 +10,11 @@
 //
 // The per-file checks are the commit hook's own (scanFileContent), so the two
 // cannot disagree about what counts as a leak. Never prints a matched value.
+//
+// A result with no findings is still incomplete when a blob was missing, a
+// version was over the size cap, the clone is shallow, or custom rules failed
+// to load. Those are unexpected omissions. Paths skipped by an allowlist are
+// approved exceptions and leave the result complete (issue #126).
 
 import { spawnSync } from "node:child_process";
 
@@ -102,14 +107,29 @@ export function parseRawLog(output) {
 }
 
 // "<sha> blob <size>" or "<sha> missing", one per line.
+function collectBlobSizes(stdout, sizes, wanted) {
+  for (const line of stdout.toString("utf8").split("\n")) {
+    const [sha, type, size] = line.split(" ");
+    if (sha && type === "blob" && (!wanted || wanted.has(sha))) sizes.set(sha, Number(size));
+  }
+}
+
 function readSizes(cwd, blobs) {
   const sizes = new Map();
   if (blobs.length === 0) return sizes;
   const result = git(cwd, ["cat-file", "--batch-check"], `${blobs.join("\n")}\n`);
-  for (const line of result.stdout.toString("utf8").split("\n")) {
-    const [sha, type, size] = line.split(" ");
-    if (sha && type === "blob") sizes.set(sha, Number(size));
-  }
+  collectBlobSizes(result.stdout, sizes);
+  if (result.status === 0) return sizes;
+
+  // A missing promisor object aborts `git cat-file --batch-check` before it
+  // lists later blobs. Those later blobs can be present locally (the tip of a
+  // partial clone). Treating them as unavailable would skip a secret that is
+  // already on disk. The local object list does not fetch; blobs that are
+  // absent stay out of the map and are reported as unavailable.
+  const local = git(cwd, ["cat-file", "--batch-all-objects", "--batch-check"]);
+  if (local.stdout.length === 0) return sizes;
+  sizes.clear();
+  collectBlobSizes(local.stdout, sizes, new Set(blobs));
   return sizes;
 }
 
@@ -293,6 +313,32 @@ export function scanHistory(options = {}) {
 const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
 const LIST_LIMIT = 10;
 
+// Exit 2: the scan ran, nothing matched, but scope or configured detection was
+// incomplete. Distinct from exit 1 (findings, or the scan could not run).
+export const HISTORY_INCOMPLETE_EXIT = 2;
+
+// Approved allowlist skips are not omissions: the caller asked for them to be
+// left out. An empty branch never walked history, so it is complete as well.
+export function isHistoryIncomplete(result) {
+  if (!result?.ok || result.empty) return false;
+  return (
+    (result.unavailableCount ?? 0) > 0 ||
+    (result.oversized?.length ?? 0) > 0 ||
+    result.shallow === true ||
+    (result.customRuleErrors?.length ?? 0) > 0
+  );
+}
+
+// `allowIncomplete` is the caller's opt-in to treat an incomplete scan with no
+// findings as success. Findings still exit 1, and a scan that did not run
+// still exits 1.
+export function historyExitCode(result, options = {}) {
+  if (!result?.ok) return 1;
+  if ((result.findings?.length ?? 0) > 0) return 1;
+  if (isHistoryIncomplete(result) && !options.allowIncomplete) return HISTORY_INCOMPLETE_EXIT;
+  return 0;
+}
+
 export function formatHistoryReport(result) {
   if (!result.ok) return `gforge history: ${result.error}\n`;
   if (result.empty) {
@@ -300,15 +346,17 @@ export function formatHistoryReport(result) {
   }
 
   const lines = [];
+  const incomplete = isHistoryIncomplete(result);
   const byCommit = new Map();
   for (const finding of result.findings) {
     if (!byCommit.has(finding.commit.sha)) byCommit.set(finding.commit.sha, []);
     byCommit.get(finding.commit.sha).push(finding);
   }
 
+  const headline = incomplete ? "GForge history scan incomplete" : "GForge history scan";
   if (result.findings.length > 0) {
     lines.push(
-      `GForge history scan - ${plural(result.findings.length, "potential secret")} in ${plural(byCommit.size, "commit")}`,
+      `${headline} - ${plural(result.findings.length, "potential secret")} in ${plural(byCommit.size, "commit")}`,
       ""
     );
     for (const [sha, findings] of byCommit) {
@@ -320,6 +368,8 @@ export function formatHistoryReport(result) {
       }
       lines.push("");
     }
+  } else if (incomplete) {
+    lines.push(`${headline} - nothing matched in the content that was scanned`, "");
   } else {
     lines.push("GForge history scan - no secrets found", "");
   }
@@ -328,12 +378,16 @@ export function formatHistoryReport(result) {
     `Scanned ${plural(result.scannedCount, "file version")} across ${plural(result.commitCount, "commit")} (${result.scope}).`
   );
   if (result.findings.length > 0) lines.push("No secret values are printed above.");
+  if (incomplete) lines.push("This scan does not assure that history is free of secrets.");
 
-  // Everything that was NOT scanned is said out loud: a clean result must not
-  // quietly mean "clean, apart from what was skipped".
-  const caveats = [];
+  // Approved exceptions (the caller opted out) are listed apart from unexpected
+  // omissions. A clean banner must not cover content that was never scanned.
+  // Caveat lines name paths and counts only. Matched values, blob bytes,
+  // environment contents, and the text of a rule error stay out of the report.
+  const approved = [];
+  const omitted = [];
   if (result.allowlistedCount > 0) {
-    caveats.push(
+    approved.push(
       `${plural(result.allowlistedCount, "file version")} skipped by .gforgeignore/.gitleaksignore - ` +
         "rerun with --no-allowlist to include them"
     );
@@ -343,24 +397,27 @@ export function formatHistoryReport(result) {
       .slice(0, LIST_LIMIT)
       .map((v) => `${v.path} @ ${v.commit.sha.slice(0, 12)} (${(v.size / 1024 / 1024).toFixed(1)} MB)`);
     const more = result.oversized.length > LIST_LIMIT ? `, and ${result.oversized.length - LIST_LIMIT} more` : "";
-    caveats.push(
+    omitted.push(
       `${plural(result.oversized.length, "file version")} over ${HISTORY_MAX_BLOB_BYTES / 1024 / 1024} MB not scanned: ${shown.join(", ")}${more}`
     );
   }
   if (result.unavailableCount > 0) {
-    caveats.push(
+    omitted.push(
       `${plural(result.unavailableCount, "file version")} not available locally (a partial clone) were not scanned - ` +
         "GForge does not download history to scan it"
     );
   }
-  if (result.shallow) caveats.push("this is a shallow clone, so history older than its depth was not scanned");
+  if (result.shallow) omitted.push("this is a shallow clone, so history older than its depth was not scanned");
   if (result.customRuleErrors?.length > 0) {
-    caveats.push(`${plural(result.customRuleErrors.length, "invalid custom rule")} in ~/.gforge/rules.json ignored`);
+    omitted.push(`${plural(result.customRuleErrors.length, "invalid custom rule")} in ~/.gforge/rules.json ignored`);
   }
-  if (caveats.length > 0) {
-    lines.push("", "Not scanned:");
-    for (const caveat of caveats) lines.push(`  - ${caveat}`);
-  }
+  const pushSection = (title, items) => {
+    if (items.length === 0) return;
+    lines.push("", `${title}:`);
+    for (const item of items) lines.push(`  - ${item}`);
+  };
+  pushSection("Approved exceptions", approved);
+  pushSection("Not scanned", omitted);
 
   if (result.findings.length > 0) {
     lines.push(
