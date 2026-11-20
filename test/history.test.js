@@ -426,3 +426,52 @@ test("issue #134: chunkVersions bounds each run, keeps order, and isolates a blo
   assert.deepEqual(runs.map((run) => run.map((x) => x.path)), [["1", "2", "3"], ["4"], ["5"], ["6"]]);
   assert.deepEqual(chunkVersions([], sizes, 100), []);
 });
+
+// ---------------------------------------------------------------------------
+// Approved local secret sources (issue #130): the same cross-reference the
+// commit hook uses, with today's values only.
+// ---------------------------------------------------------------------------
+test("issue #130: history cross-references approved sources and says it covers current values only", async () => {
+  const r = await makeRepo();
+  const secret = ["hist", "Kq81Zp", "approved"].join("-");
+  // Ignored, so the private file itself never enters history.
+  await r.write(".gitignore", "config/local.json\n");
+  await r.write("config/local.json", JSON.stringify({ api: { token: secret } }));
+  await r.write("src/client.js", `export const token = "${secret}";\n`);
+  const leaked = r.commit("hardcode the token");
+  await mkdir(join(r.home, ".gforge"), { recursive: true });
+  await writeFile(
+    join(r.home, ".gforge", "sources.json"),
+    JSON.stringify({
+      repositories: [
+        {
+          path: r.repo,
+          sources: [
+            { file: "config/local.json", format: "json", keys: ["api.token"] },
+            { file: "config/missing.json", format: "json", keys: ["api.token"] }
+          ]
+        }
+      ]
+    })
+  );
+
+  const result = r.scan();
+  assert.ok(ids(result).includes("src/client.js:1 hardcoded-known-secret"));
+  assert.equal(result.findings.find((f) => f.ruleId === "hardcoded-known-secret").commit.sha, leaked);
+  assert.equal(result.approvedSources.secretCount, 1);
+
+  const report = formatHistoryReport(result);
+  assert.match(report, /current values only - credentials they held in the past are not covered/);
+  assert.match(report, /approved secret source config\/missing\.json \(json\) incomplete: not found/);
+  assert.doesNotMatch(report, new RegExp(secret));
+  assert.doesNotMatch(JSON.stringify(result.approvedSources), new RegExp(secret));
+});
+
+test("issue #130: without sources.json history reports no approved-source caveat", async () => {
+  const r = await makeRepo();
+  await r.write("app.js", "export const x = 1;\n");
+  r.commit("init");
+  const result = r.scan();
+  assert.deepEqual(result.approvedSources, { sources: [], errors: [], secretCount: 0 });
+  assert.doesNotMatch(formatHistoryReport(result), /approved secret source/);
+});

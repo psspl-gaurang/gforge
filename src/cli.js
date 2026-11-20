@@ -15,7 +15,7 @@ import {
   readCachedUpdateNotice
 } from "./npm-update.js";
 import { formatHistoryReport, scanHistory } from "./history.js";
-import { describeDotenvSources } from "./scanner.js";
+import { describeApprovedSecretSources, describeDotenvSources } from "./scanner.js";
 import { runSettingsCommand } from "./settings.js";
 import { createVerificationReport, formatVerificationReport } from "./verify.js";
 
@@ -55,7 +55,11 @@ export async function runCli(args, streams, options = {}) {
       environment
     });
     const dotenvReport = (options.describeDotenvSources ?? describeDotenvSources)();
-    const report = createVerificationReport(environment, managedHooksReport, dotenvReport);
+    const approvedSourcesReport = (options.describeApprovedSecretSources ?? describeApprovedSecretSources)(
+      undefined,
+      options.home
+    );
+    const report = createVerificationReport(environment, managedHooksReport, dotenvReport, approvedSourcesReport);
 
     streams.stdout.write(formatVerificationReport(report));
     const notice = (options.readCachedUpdateNotice ?? readCachedUpdateNotice)(VERSION);

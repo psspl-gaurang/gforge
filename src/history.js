@@ -17,6 +17,7 @@ import {
   decodeBlob,
   isPathAllowlisted,
   loadAllowlist,
+  loadApprovedSecretSources,
   loadCustomRules,
   loadDotenvSecrets,
   scanFileContent
@@ -227,6 +228,11 @@ export function scanHistory(options = {}) {
   const allowlist = useAllowlist ? (options.allowlistPatterns ?? loadAllowlist(root)) : [];
   const dotenvSecrets = options.dotenvSecrets ?? loadDotenvSecrets(root);
   const pack = options.customRules ? { rules: options.customRules, errors: [] } : loadCustomRules(options.home);
+  // Today's values only: past versions of a private source are never fetched,
+  // so a credential rotated out of it before now is not cross-referenced.
+  const approved = options.knownSecrets
+    ? { secrets: options.knownSecrets, sources: [], errors: [] }
+    : loadApprovedSecretSources(root, options.home);
 
   const findings = [];
   const allowlisted = [];
@@ -264,6 +270,7 @@ export function scanHistory(options = {}) {
       scannedCount += 1;
       const fileFindings = scanFileContent(version.path, decodeBlob(raw), {
         dotenvSecrets,
+        knownSecrets: approved.secrets,
         customRules: pack.rules,
         // An audit must not be blindable by the repository being audited.
         ignoreInlineAllow: !useAllowlist
@@ -286,7 +293,8 @@ export function scanHistory(options = {}) {
     oversized,
     unavailableCount: unavailable.length,
     shallow: gitText(root, ["rev-parse", "--is-shallow-repository"]) === "true",
-    customRuleErrors: pack.errors
+    customRuleErrors: pack.errors,
+    approvedSources: { sources: approved.sources, errors: approved.errors, secretCount: approved.secrets.length }
   };
 }
 
@@ -356,6 +364,19 @@ export function formatHistoryReport(result) {
   if (result.shallow) caveats.push("this is a shallow clone, so history older than its depth was not scanned");
   if (result.customRuleErrors?.length > 0) {
     caveats.push(`${plural(result.customRuleErrors.length, "invalid custom rule")} in ~/.gforge/rules.json ignored`);
+  }
+  const approved = result.approvedSources;
+  if (approved?.errors?.length > 0) {
+    caveats.push(`${plural(approved.errors.length, "approved secret source problem")} in ~/.gforge/sources.json`);
+  }
+  for (const source of (approved?.sources ?? []).filter((s) => s.incomplete)) {
+    caveats.push(`approved secret source ${source.file} (${source.format}) incomplete: ${source.incomplete}`);
+  }
+  if (approved?.sources?.length > 0) {
+    caveats.push(
+      "approved secret sources were cross-referenced with their current values only - " +
+        "credentials they held in the past are not covered"
+    );
   }
   if (caveats.length > 0) {
     lines.push("", "Not scanned:");

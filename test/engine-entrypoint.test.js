@@ -215,6 +215,38 @@ test("issue #49: the engine blocks a staged secret without printing it", { skip:
   assert.equal(run.stderr.includes(leakedValue), false, "the report must never contain the value");
 });
 
+test("issue #130: the standalone engine cross-references approved local secret sources", { skip: posixOnly }, async (t) => {
+  const m = await machine(t);
+  await writeFreshCache(m, { latest: VERSION, versions: [VERSION], distTags: { latest: VERSION } });
+  const approvedValue = ["eng", "Wq37Lx", "approved"].join("-");
+  await mkdir(join(m.repo, "config"));
+  // Approved but never staged: the private file stays out of the commit.
+  await writeFile(join(m.repo, "config", "local.json"), JSON.stringify({ api: { token: approvedValue } }));
+  await writeFile(
+    join(m.home, ".gforge", "sources.json"),
+    JSON.stringify({
+      repositories: [
+        {
+          path: m.repo,
+          sources: [
+            { file: "config/local.json", format: "json", keys: ["api.token"] },
+            { file: "../outside.json", format: "json", keys: ["api.token"] }
+          ]
+        }
+      ]
+    })
+  );
+  // Plain text, so no other rule could be the one that blocks it.
+  await m.stage("notes.txt", `copied ${approvedValue} here\n`);
+
+  const run = await runEngine(m, ["pre-commit"]);
+  assert.equal(run.status, 1, run.stderr);
+  assert.match(run.stderr, /hardcoded-known-secret/);
+  assert.match(run.stderr, /approved secret sources in .*sources\.json are incomplete/);
+  assert.match(run.stderr, /must not contain \.\. segments/);
+  assert.equal(run.stderr.includes(approvedValue), false, "the report must never contain the value");
+});
+
 // ---------------------------------------------------------------------------
 // What the commit path says about updates. Only reachable from a baked engine.
 // ---------------------------------------------------------------------------

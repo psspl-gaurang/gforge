@@ -58,9 +58,23 @@ export function isHeuristicExemptPath(filePath, env = process.env) {
 // rule identifiers.
 
 import { execFileSync, spawn } from "node:child_process";
-import { readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Baked at install time (see getScannerContent in hooks.js). Left as a literal
@@ -710,6 +724,7 @@ const RESERVED_RULE_IDS = new Set([
   "twilio-auth-token",
   "high-entropy-string",
   "hardcoded-dotenv-secret",
+  "hardcoded-known-secret",
   "secret-file",
   "secret-file-env",
   // Context rules, not entries in PROVIDER_RULES, so the map above misses them.
@@ -1253,6 +1268,479 @@ export function describeDotenvSources(root = repoRoot()) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Approved local secret sources: the .env cross-reference extended to private
+// config files a developer explicitly names - config/secrets.local.json,
+// application-local.properties - so a value copied out of one of them is
+// caught the same way (issue #130).
+//
+// Approvals live at ~/.gforge/sources.json, never in the repository, for the
+// reason the rule pack does: a clone must not be able to choose what GForge
+// reads. Each approval names a repository by absolute path, then files
+// RELATIVE to it, and every read is confined to that repository's real root -
+// no absolute paths, no `..`, nothing inside .git, and a symlink that resolves
+// outside the root is refused rather than followed.
+//
+// Data only: JSON goes through JSON.parse and .properties through a line
+// parser that does no ${...} expansion. Nothing is executed, rendered,
+// included or fetched, and values that are themselves references (`${VAR}`,
+// `op://...`) are skipped rather than resolved. YAML and TOML are deferred:
+// neither has a built-in parser, and a hand-rolled subset that misreads a real
+// file would fail silently.
+//
+// Values are held in memory for the scan and never printed, stored or hashed;
+// reports carry file paths, formats and counts only.
+// ---------------------------------------------------------------------------
+export const SECRET_SOURCE_FORMATS = ["json", "properties"];
+const DEFERRED_SECRET_SOURCE_FORMATS = new Set(["yaml", "yml", "toml"]);
+const SECRET_SOURCES_CONFIG_MAX_BYTES = 256 * 1024;
+const SECRET_SOURCES_MAX_REPOSITORIES = 100;
+const SECRET_SOURCES_MAX_PER_REPOSITORY = 50;
+const SECRET_SOURCE_MAX_KEYS = 100;
+const SECRET_SOURCE_KEY_MAX_LENGTH = 200;
+const SECRET_SOURCE_KEY_MAX_SEGMENTS = 32;
+const SECRET_SOURCE_PATH_MAX_LENGTH = 400;
+export const SECRET_SOURCE_MAX_BYTES = 1024 * 1024;
+// Across every source of one repository, so a long list of large files cannot
+// stall the commit even when each one is under the per-file limit.
+export const SECRET_SOURCES_TOTAL_MAX_BYTES = 8 * 1024 * 1024;
+export const SECRET_SOURCE_MAX_DEPTH = 64;
+const SECRET_SOURCE_VALUE_MAX_LENGTH = 8192;
+export const KNOWN_SECRETS_MAX = 1000;
+// Values that point at a secret rather than being one. They are never
+// resolved, and the reference text itself is not worth cross-referencing.
+const SECRET_REFERENCE_RE =
+  /\$\{|\{\{|%\(|^<[^>]*>$|^(?:op|vault|secret|secrets|keyvault|awssm|gcpsm|ref\+[a-z]+):\/\/|^arn:aws:(?:secretsmanager|ssm):/i;
+
+export function secretSourcesPath(home = homedir()) {
+  return join(home, ".gforge", "sources.json");
+}
+
+function secretSourceFileProblem(file) {
+  if (typeof file !== "string" || !file) return "file is required";
+  if (file.length > SECRET_SOURCE_PATH_MAX_LENGTH) {
+    return `file must be at most ${SECRET_SOURCE_PATH_MAX_LENGTH} characters`;
+  }
+  if (/[\x00-\x1f]/.test(file)) return "file must not contain control characters";
+  const normalized = file.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) return "file must be relative to the repository";
+  const segments = normalized.split("/").filter((segment) => segment && segment !== ".");
+  if (segments.length === 0) return "file is required";
+  if (segments.includes("..")) return "file must not contain .. segments";
+  if (segments.some((segment) => segment.toLowerCase() === ".git")) return "file must not be inside .git";
+  return null;
+}
+
+function normalizeSecretSourceFile(file) {
+  return file
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((segment) => segment && segment !== ".")
+    .join("/");
+}
+
+function secretSourceKeyProblem(key, format) {
+  if (typeof key !== "string" || !key) return "keys must be non-empty strings";
+  if (key.length > SECRET_SOURCE_KEY_MAX_LENGTH) return `keys must be at most ${SECRET_SOURCE_KEY_MAX_LENGTH} characters`;
+  if (/[\x00-\x1f]/.test(key)) return "keys must not contain control characters";
+  if (format === "json") {
+    const segments = key.split(".");
+    if (segments.some((segment) => !segment)) return "JSON keys are dotted paths with no empty segments";
+    if (segments.length > SECRET_SOURCE_KEY_MAX_SEGMENTS) {
+      return `JSON keys may have at most ${SECRET_SOURCE_KEY_MAX_SEGMENTS} segments`;
+    }
+  }
+  return null;
+}
+
+// Returns { repositories, errors }. Like parseCustomRules, every rejection is
+// reported by position and the surviving entries are kept: one bad source
+// does not disable the others.
+export function parseSecretSources(text) {
+  const errors = [];
+  if (!text || !String(text).trim()) return { repositories: [], errors };
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { repositories: [], errors: ["not valid JSON"] };
+  }
+
+  const declared = parsed?.repositories;
+  if (!Array.isArray(declared)) {
+    return { repositories: [], errors: ['expected an object with a "repositories" array'] };
+  }
+  if (declared.length > SECRET_SOURCES_MAX_REPOSITORIES) {
+    return {
+      repositories: [],
+      errors: [`too many repositories (${declared.length}, limit ${SECRET_SOURCES_MAX_REPOSITORIES})`]
+    };
+  }
+
+  const repositories = [];
+  declared.forEach((entry, repoIndex) => {
+    const where = `repository ${repoIndex + 1}`;
+    if (!entry || typeof entry !== "object") return errors.push(`${where}: not an object`);
+    if (typeof entry.path !== "string" || !entry.path || entry.path.includes("\0") || !isAbsolute(entry.path)) {
+      return errors.push(`${where}: path must be an absolute path to the repository root`);
+    }
+    if (!Array.isArray(entry.sources)) return errors.push(`${where}: expected a "sources" array`);
+    if (entry.sources.length > SECRET_SOURCES_MAX_PER_REPOSITORY) {
+      return errors.push(
+        `${where}: too many sources (${entry.sources.length}, limit ${SECRET_SOURCES_MAX_PER_REPOSITORY})`
+      );
+    }
+
+    const sources = [];
+    const seen = new Set();
+    entry.sources.forEach((source, sourceIndex) => {
+      const at = `${where} source ${sourceIndex + 1}`;
+      const reject = (reason) => errors.push(`${at}: ${reason}`);
+      if (!source || typeof source !== "object") return reject("not an object");
+      const fileProblem = secretSourceFileProblem(source.file);
+      if (fileProblem) return reject(fileProblem);
+      const file = normalizeSecretSourceFile(source.file);
+      const format = typeof source.format === "string" ? source.format.toLowerCase() : source.format;
+      if (DEFERRED_SECRET_SOURCE_FORMATS.has(format)) {
+        return reject(`${file}: format "${format}" is not supported yet; use ${SECRET_SOURCE_FORMATS.join(" or ")}`);
+      }
+      if (!SECRET_SOURCE_FORMATS.includes(format)) {
+        return reject(`${file}: format must be ${SECRET_SOURCE_FORMATS.join(" or ")}`);
+      }
+      if (!Array.isArray(source.keys) || source.keys.length === 0) {
+        return reject(`${file}: keys must list the secret keys to read`);
+      }
+      if (source.keys.length > SECRET_SOURCE_MAX_KEYS) {
+        return reject(`${file}: too many keys (${source.keys.length}, limit ${SECRET_SOURCE_MAX_KEYS})`);
+      }
+      for (const key of source.keys) {
+        const keyProblem = secretSourceKeyProblem(key, format);
+        if (keyProblem) return reject(`${file}: ${keyProblem}`);
+      }
+      if (seen.has(file)) return reject(`${file}: listed more than once`);
+      seen.add(file);
+      sources.push({ file, format, keys: [...new Set(source.keys)] });
+    });
+
+    repositories.push({ path: entry.path, sources });
+  });
+
+  return { repositories, errors };
+}
+
+function readSecretSourcesConfig(home) {
+  const path = secretSourcesPath(home);
+  try {
+    if (statSync(path).size > SECRET_SOURCES_CONFIG_MAX_BYTES) {
+      return { text: null, error: `larger than ${SECRET_SOURCES_CONFIG_MAX_BYTES / 1024} KB` };
+    }
+    return { text: readFileSync(path, "utf8"), error: null };
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return { text: null, error: null };
+    return { text: null, error: `could not be read (${fsReadReason(error)})` };
+  }
+}
+
+function fsReadReason(error) {
+  switch (error?.code) {
+    case "EACCES":
+    case "EPERM":
+      return "permission denied";
+    case "ENOENT":
+    case "ENOTDIR":
+      return "not found";
+    case "ELOOP":
+      return "symlink loop";
+    default:
+      return "unreadable";
+  }
+}
+
+function samePath(a, b) {
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function realOrResolved(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+// Reads `file` only if its real path stays inside `rootReal`. Returns
+// { buffer } or { reason }; never throws.
+function readContainedFile(rootReal, file, remainingBytes) {
+  let real;
+  try {
+    real = realpathSync(join(rootReal, ...file.split("/")));
+  } catch (error) {
+    return { reason: fsReadReason(error) };
+  }
+  const rel = relative(rootReal, real);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return { reason: "resolves outside the repository" };
+  }
+  if (rel.split(sep).some((segment) => segment.toLowerCase() === ".git")) {
+    return { reason: "resolves inside .git" };
+  }
+
+  let fd;
+  try {
+    // Checked before opening: opening a FIFO for reading blocks until a writer
+    // appears, which would hang the commit.
+    if (!lstatSync(real).isFile()) return { reason: "not a regular file" };
+    fd = openSync(real, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { reason: "not a regular file" };
+    if (stat.size > SECRET_SOURCE_MAX_BYTES) return { reason: `larger than ${SECRET_SOURCE_MAX_BYTES / 1024 / 1024} MB` };
+    if (stat.size > remainingBytes) return { reason: "read budget exhausted" };
+    const buffer = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const read = readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (read === 0) break;
+      offset += read;
+    }
+    return { buffer: buffer.subarray(0, offset) };
+  } catch (error) {
+    return { reason: fsReadReason(error) };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed or never fully opened; nothing else to release
+      }
+    }
+  }
+}
+
+// Nesting depth of a JSON text, counted outside strings, so an absurdly deep
+// document is refused before JSON.parse has to recurse into it.
+export function jsonNestingDepth(text) {
+  let depth = 0;
+  let max = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{" || ch === "[") {
+      depth += 1;
+      if (depth > max) max = depth;
+    } else if (ch === "}" || ch === "]") {
+      depth -= 1;
+    }
+  }
+  return max;
+}
+
+// { found, value } for each selected dotted path. Object.hasOwn keeps a key
+// such as "constructor" or "__proto__" from walking into the prototype chain.
+function selectJsonValues(text, keys) {
+  if (jsonNestingDepth(text) > SECRET_SOURCE_MAX_DEPTH) {
+    return { reason: `nested deeper than ${SECRET_SOURCE_MAX_DEPTH} levels` };
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // The parser's message quotes the offending text, which may be a value.
+    return { reason: "not valid JSON" };
+  }
+  return {
+    selected: keys.map((key) => {
+      let node = data;
+      for (const segment of key.split(".")) {
+        if (node === null || typeof node !== "object" || !Object.hasOwn(node, segment)) return { found: false };
+        node = node[segment];
+      }
+      return { found: true, value: node };
+    })
+  };
+}
+
+const PROPERTIES_ESCAPES = { t: "\t", n: "\n", r: "\r", f: "\f" };
+
+function unescapeProperties(text) {
+  return text.replace(/\\(u[0-9a-fA-F]{4}|[^])/g, (_, escape) =>
+    escape.length === 5 ? String.fromCharCode(Number.parseInt(escape.slice(1), 16)) : (PROPERTIES_ESCAPES[escape] ?? escape)
+  );
+}
+
+function endsWithLineContinuation(line) {
+  let count = 0;
+  for (let i = line.length - 1; i >= 0 && line[i] === "\\"; i -= 1) count += 1;
+  return count % 2 === 1;
+}
+
+// Java .properties: `key=value`, `key: value` or `key value`, `#`/`!`
+// comments, backslash line continuations and escapes. Values are literal -
+// `${other.key}` stays as written - and a later duplicate key wins, as it does
+// for java.util.Properties.
+export function parseProperties(text) {
+  const entries = new Map();
+  const lines = text.split(/\r\n|\r|\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    let line = lines[i].replace(/^[ \t\f]+/, "");
+    if (!line || line[0] === "#" || line[0] === "!") continue;
+    while (endsWithLineContinuation(line) && i + 1 < lines.length) {
+      i += 1;
+      line = line.slice(0, -1) + lines[i].replace(/^[ \t\f]+/, "");
+    }
+    if (endsWithLineContinuation(line)) line = line.slice(0, -1);
+
+    let end = 0;
+    while (end < line.length) {
+      const ch = line[end];
+      if (ch === "\\") {
+        end += 2;
+        continue;
+      }
+      if (ch === "=" || ch === ":" || ch === " " || ch === "\t" || ch === "\f") break;
+      end += 1;
+    }
+    let rest = line.slice(end).replace(/^[ \t\f]+/, "");
+    if (rest[0] === "=" || rest[0] === ":") rest = rest.slice(1).replace(/^[ \t\f]+/, "");
+    entries.set(unescapeProperties(line.slice(0, end)), unescapeProperties(rest));
+  }
+  return entries;
+}
+
+function selectPropertiesValues(text, keys) {
+  const entries = parseProperties(text);
+  return {
+    selected: keys.map((key) => (entries.has(key) ? { found: true, value: entries.get(key) } : { found: false }))
+  };
+}
+
+// The key was chosen by the developer, so it stands in for .env's key-name
+// test, but the value still has to look like a credential: a short or common
+// word is exactly what turns an exact-string cross-reference into noise
+// (issue #43), and a reference is not the secret it points at.
+export function looksLikeApprovedSecretValue(value) {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (trimmed.length < DOTENV_MIN_KEYED_VALUE_LENGTH || trimmed.length > SECRET_SOURCE_VALUE_MAX_LENGTH) return false;
+  if (DOTENV_VALUE_STOPLIST.test(trimmed) || VALUE_PLACEHOLDER_RE.test(trimmed)) return false;
+  if (/^\d+$/.test(trimmed)) return false;
+  if (DOTENV_HEX_COLOR_RE.test(trimmed)) return false;
+  if (/^(.)\1+$/.test(trimmed)) return false; // xxxxxxxxxx, **********
+  if (SECRET_REFERENCE_RE.test(trimmed)) return false;
+  return true;
+}
+
+function readApprovedSource(rootReal, source, budget) {
+  const record = {
+    file: source.file,
+    format: source.format,
+    keys: source.keys.length,
+    count: 0,
+    missing: 0,
+    skipped: 0,
+    incomplete: null
+  };
+  const read = readContainedFile(rootReal, source.file, budget.bytes);
+  if (read.reason) return { record: { ...record, incomplete: read.reason }, values: [] };
+  budget.bytes -= read.buffer.length;
+
+  const text = decodeBlob(read.buffer);
+  if (text.includes("\0")) return { record: { ...record, incomplete: "not a text file" }, values: [] };
+  const result = source.format === "json" ? selectJsonValues(text, source.keys) : selectPropertiesValues(text, source.keys);
+  if (result.reason) return { record: { ...record, incomplete: result.reason }, values: [] };
+
+  const values = [];
+  for (const entry of result.selected) {
+    if (!entry.found) record.missing += 1;
+    else if (looksLikeApprovedSecretValue(entry.value)) values.push(entry.value.trim());
+    else record.skipped += 1;
+  }
+  if (record.missing > 0) {
+    record.incomplete = `${record.missing} of ${record.keys} selected key(s) not found`;
+  }
+  return { record, values };
+}
+
+// Everything approved for the repository at `root`: { configured, inRepo,
+// secrets, sources, errors }. `secrets` is the in-memory value list for the
+// scan; `sources` and `errors` are safe to print. Never throws - a broken
+// approval file leaves every other scanner layer running.
+export function loadApprovedSecretSources(root = repoRoot(), home = homedir()) {
+  const result = { configured: false, inRepo: Boolean(root), secrets: [], sources: [], errors: [] };
+  const config = readSecretSourcesConfig(home);
+  if (config.error) return { ...result, configured: true, errors: [config.error] };
+  if (config.text === null) return result;
+  result.configured = true;
+
+  const { repositories, errors } = parseSecretSources(config.text);
+  result.errors.push(...errors);
+  if (!root) return result;
+
+  const rootReal = realOrResolved(root);
+  const seen = new Set();
+  const approved = [];
+  for (const repository of repositories) {
+    if (!samePath(realOrResolved(repository.path), rootReal)) continue;
+    for (const source of repository.sources) {
+      const key = process.platform === "win32" ? source.file.toLowerCase() : source.file;
+      if (seen.has(key)) {
+        result.errors.push(`${source.file}: approved more than once for this repository; using the first entry`);
+        continue;
+      }
+      seen.add(key);
+      approved.push(source);
+    }
+  }
+
+  const secrets = new Set();
+  const budget = { bytes: SECRET_SOURCES_TOTAL_MAX_BYTES };
+  for (const source of approved) {
+    const { record, values } = readApprovedSource(rootReal, source, budget);
+    for (const value of values) {
+      if (secrets.size >= KNOWN_SECRETS_MAX) {
+        record.incomplete = record.incomplete ?? `value budget of ${KNOWN_SECRETS_MAX} exhausted`;
+        break;
+      }
+      if (!secrets.has(value)) {
+        secrets.add(value);
+        record.count += 1;
+      }
+    }
+    result.sources.push(record);
+  }
+  result.secrets = [...secrets];
+  return result;
+}
+
+// The read-only view for `gforge verify` and reports: the same load, minus
+// the values.
+export function describeApprovedSecretSources(root = repoRoot(), home = homedir()) {
+  const { secrets, ...summary } = loadApprovedSecretSources(root, home);
+  return { ...summary, secretCount: secrets.length };
+}
+
+function describeIncompleteSource(source) {
+  return `${source.file} (${source.format}): ${source.incomplete}`;
+}
+
+export function formatApprovedSourceWarnings(report, home = homedir()) {
+  const errors = report?.errors ?? [];
+  const incomplete = (report?.sources ?? []).filter((source) => source.incomplete);
+  if (errors.length === 0 && incomplete.length === 0) return "";
+  const lines = [`GForge: approved secret sources in ${secretSourcesPath(home)} are incomplete`];
+  for (const error of errors) lines.push(`  - ${error}`);
+  for (const source of incomplete) lines.push(`  - ${describeIncompleteSource(source)}`);
+  lines.push("  The other scanner layers are unaffected.");
+  return `${lines.join("\n")}\n`;
+}
+
 // Finds the first occurrence of `needle` that isn't embedded inside a larger
 // run of identifier characters on either side — a short secret value must
 // not match as a coincidental fragment of an unrelated, longer word/token
@@ -1304,7 +1792,7 @@ function runGitleaks() {
 // #88). A null content still gets the filename rule - a committed .env is a
 // finding even when it cannot be read.
 export function scanFileContent(file, content, options = {}) {
-  const { dotenvSecrets = [], customRules = [] } = options;
+  const { dotenvSecrets = [], knownSecrets = [], customRules = [] } = options;
   const findings = [];
 
   const fileRule = matchFilenameRule(file);
@@ -1313,17 +1801,20 @@ export function scanFileContent(file, content, options = {}) {
   }
   if (content === null || content === undefined) return findings;
 
-  // Highest-precision check: a real secret value from .env hardcoded here.
-  for (const secret of dotenvSecrets) {
-    const index = findWordBoundaryIndex(content, secret);
-    if (index !== -1) {
-      findings.push({
-        file,
-        line: content.slice(0, index).split(/\r?\n/).length,
-        ruleId: "hardcoded-dotenv-secret",
-        description: "a secret value from a .env file is hardcoded here"
-      });
-      break; // one is enough to block; do not enumerate values
+  // Highest-precision check: a real secret value from .env, or from an
+  // approved local secret source, hardcoded here. One is enough to block, so
+  // a value both lists hold is reported once, under .env.
+  const crossReferences = [
+    [dotenvSecrets, "hardcoded-dotenv-secret", "a secret value from a .env file is hardcoded here"],
+    [knownSecrets, "hardcoded-known-secret", "a secret value from an approved local secret source is hardcoded here"]
+  ];
+  crossReference: for (const [secrets, ruleId, description] of crossReferences) {
+    for (const secret of secrets) {
+      const index = findWordBoundaryIndex(content, secret);
+      if (index !== -1) {
+        findings.push({ file, line: content.slice(0, index).split(/\r?\n/).length, ruleId, description });
+        break crossReference; // do not enumerate values
+      }
     }
   }
 
@@ -1343,19 +1834,35 @@ export function scanStaged(options = {}) {
   // Loaded once per commit rather than per file: the pack is small, but
   // recompiling its regexes for every staged path would be pure waste.
   const customRulePack = options.customRules ? { rules: options.customRules, errors: [] } : loadCustomRules();
+  const approved = options.knownSecrets
+    ? { secrets: options.knownSecrets, sources: [], errors: [] }
+    : loadApprovedSecretSources(repoRoot(), options.home);
   const findings = [];
 
   for (const file of files) {
     if (isPathAllowlisted(file, allowlist)) continue;
     const content = options.read ? options.read(file) : stagedContent(file);
-    findings.push(...scanFileContent(file, content, { ...options, dotenvSecrets, customRules: customRulePack.rules }));
+    findings.push(
+      ...scanFileContent(file, content, {
+        ...options,
+        dotenvSecrets,
+        knownSecrets: approved.secrets,
+        customRules: customRulePack.rules
+      })
+    );
   }
 
   const gitleaks = options.runGitleaks === false ? { available: false, leaks: false } : runGitleaks();
   // Reported so a pack that silently stopped loading is visible. Never fatal:
   // a rejected rule leaves the built-in rules running, and refusing the commit
   // over a malformed preference file would be its own outage (issue #93).
-  return { findings, gitleaks, customRules: customRulePack };
+  // Approved sources are reported the same way, without their values.
+  return {
+    findings,
+    gitleaks,
+    customRules: customRulePack,
+    approvedSources: { sources: approved.sources, errors: approved.errors }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,6 +1928,8 @@ export function runPreCommit(write = (s) => process.stderr.write(s)) {
   // failure the developer would otherwise never notice.
   const warning = formatCustomRuleErrors(result.customRules?.errors ?? []);
   if (warning) write(warning);
+  const sourceWarning = formatApprovedSourceWarnings(result.approvedSources);
+  if (sourceWarning) write(sourceWarning);
   const blocked = result.findings.length > 0 || result.gitleaks?.leaks;
   if (blocked) {
     write(formatReport(result, { color: colorEnabled(process.stderr) }));
