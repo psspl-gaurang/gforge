@@ -225,9 +225,10 @@ or before GForge existed — is invisible to it. `gforge history` closes that ga
 Run it from anywhere inside a repository; nothing is installed per repo:
 
 ```bash
-gforge history                 # everything reachable from HEAD, like `git log`
-gforge history --all           # every branch and tag
-gforge history --no-allowlist  # ignore .gforgeignore and gforge:allow markers
+gforge history                    # everything reachable from HEAD, like `git log`
+gforge history --all              # every branch and tag
+gforge history --no-allowlist     # ignore .gforgeignore and gforge:allow markers
+gforge history --allow-incomplete # exit 0 when nothing matched but the scan was incomplete
 ```
 
 ```
@@ -244,17 +245,32 @@ It applies exactly the checks the commit hook does, to every past version of
 every file — including files deleted since and content that first appeared in a
 merge. Each finding names the commit that **introduced** it, and
 `(still in HEAD)` marks a leak that is still in the current tree rather than only
-in history. Values are never printed. It exits `1` when anything is found, so it
-can gate a CI job.
+in history. Values are never printed. The report goes to stdout when the scan
+runs. Usage errors, and a scan that cannot start, go to stderr.
+
+The exit status is how a caller tells a finished scan from one that did not see
+everything:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | The scan finished and found nothing. Paths skipped by `.gforgeignore` or `.gitleaksignore`, and lines marked `gforge:allow`, are approved exceptions: they do not make the scan incomplete. A branch with no commits, and `--all` when the repository has no refs, are complete. |
+| `1` | A potential secret was found, or the scan could not run (not a git repository, `git` failed, or an unknown option). A finding is still exit `1` when the scan was also incomplete. |
+| `2` | Nothing matched in the content that was scanned, but the scan was incomplete: a file version was missing locally, a file version was over 10 MB, the clone is shallow, or `~/.gforge/rules.json` contains invalid rules. This is not a clean result. |
+
+`--allow-incomplete` exits `0` for that last case only. It does not hide
+findings, and the report still says the scan does not assure that history is
+free of secrets. A missing `rules.json` is normal and is not an incomplete scan.
 
 A secret that was ever pushed should be treated as compromised: **rotate it
 first**. Rewriting history removes the copy, not the exposure.
 
-Anything not scanned is listed under *Not scanned*, never skipped silently:
-versions hidden by `.gforgeignore` (rerun with `--no-allowlist` to audit a
-repository whose own allowlist you do not trust), file versions over 10 MB, and
-the history a shallow or partial clone does not hold locally. In a partial
-clone, GForge reports the missing versions rather than downloading them.
+Approved allowlist skips are listed under *Approved exceptions*. Unexpected
+omissions are listed under *Not scanned*, never skipped silently: file versions
+over 10 MB, history a shallow or partial clone does not hold locally, and
+invalid custom rules. An incomplete report is not proof that history is clean.
+In a partial clone, GForge reports the missing versions rather than downloading
+them. Rerun with `--no-allowlist` to audit a repository whose own allowlist you
+do not trust.
 
 ## Managing false positives
 
