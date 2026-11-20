@@ -40,6 +40,10 @@ installed as `~/.gforge/hooks/gforge-scan.mjs`):
 - Generic credential keyword=value detection (catches `DB_PASS=…`).
 - Shannon-entropy detection for unnamed secrets (skips SHAs/UUIDs/lockfiles).
 - Secret-file rules (`.env`, `id_rsa`, `*.p12`, keystores, …; templates allowed).
+- Approved local secret sources (`~/.gforge/sources.json`): selected keys from
+  repo-local JSON/properties files, cross-referenced like `.env` values. Home-only
+  approvals, reads confined to the repo's real root, data-only parsing, size/value
+  budgets. YAML/TOML deferred until a safe parser is chosen.
 - Allowlist via `.gforgeignore` and inline `gforge:allow`.
 - Optional gitleaks pass merged in when the binary is present.
 - Redacted output (never prints matched values); fails closed on scan errors.

@@ -100,6 +100,38 @@ test("runs read-only verification", async () => {
   assert.equal(streams.stderr.value, "");
 });
 
+test("issue #130: verify reports approved secret sources from the given home", async () => {
+  const streams = createStreams();
+  const calls = [];
+  const result = await runCli(["verify"], streams, {
+    home: "/Users/example",
+    readCachedUpdateNotice: () => null,
+    detectEnvironment: async () => ({
+      platform: { name: "darwin", arch: "arm64", supported: true, isWsl: false },
+      home: { path: "/Users/example", present: true },
+      shell: { path: "/bin/zsh", name: "zsh", supported: true },
+      node: { version: "20.11.0", major: 20, supported: true },
+      git: { available: true, version: "2.45.0", rawVersion: "git version 2.45.0" }
+    }),
+    verifyManagedHooks: async () => ({ hooksDirectory: "/Users/example/.gforge/hooks", checks: [] }),
+    describeDotenvSources: () => ({ inRepo: false, root: null, files: [], secretCount: 0 }),
+    describeApprovedSecretSources: (root, home) => {
+      calls.push({ root, home });
+      return {
+        configured: true,
+        inRepo: true,
+        sources: [{ file: "config/local.json", format: "json", keys: 1, count: 1, missing: 0, skipped: 0, incomplete: null }],
+        errors: [],
+        secretCount: 1
+      };
+    }
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [{ root: undefined, home: "/Users/example" }]);
+  assert.match(streams.stdout.value, /PASS approved-secret-sources: 1 value\(s\) cross-referenced from config\/local\.json/);
+});
+
 test("fails verification when git is unavailable", async () => {
   const streams = createStreams();
   const result = await runCli(["verify"], streams, {

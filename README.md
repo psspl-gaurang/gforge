@@ -117,7 +117,7 @@ gforge <command> [--force]
 | Command | Description |
 | --- | --- |
 | `gforge install` | Upgrade to the latest version (if any) and install the global hooks. |
-| `gforge verify` | Read-only health check of the environment, the installed hooks, and (inside a repo) the `.env` files the cross-reference can see. |
+| `gforge verify` | Read-only health check of the environment, the installed hooks, and (inside a repo) the `.env` files and approved secret sources the cross-reference can see. |
 | `gforge history` | Scan the current repository's existing commit history for secrets committed before GForge was installed. Read-only. See [Scanning existing history](#scanning-existing-history). |
 | `gforge update` | Upgrade to the latest version (if any) and refresh the hooks. |
 | `gforge uninstall` | Remove GForge-owned hooks and restore your previous Git config. |
@@ -139,7 +139,9 @@ value**. Detection runs several layers in order:
    Every `.env` in the repository is used, not only the root one, so a monorepo's
    `server/.env` and `client/.env` are covered. Template files are skipped, and
    the search prunes vendored and build directories (`node_modules`, `dist`, …).
-   `gforge verify` prints which `.env` files this layer found.
+   `gforge verify` prints which `.env` files this layer found. Private config
+   files you approve are cross-referenced the same way — see
+   [Approved local secret sources](#approved-local-secret-sources).
 2. **Provider rules** — fixed credential shapes for the major cloud and SaaS
    providers: AWS, GCP (API keys, OAuth secrets and service-account key files),
    Azure, GitHub, GitLab, Slack, Stripe, Twilio, SendGrid, OpenAI, Anthropic,
@@ -217,6 +219,48 @@ rules keep running, so a malformed file never disables scanning.
 
 An organization distributes the file with whatever configuration management it
 already uses — GForge never fetches rules over the network.
+
+### Approved local secret sources
+
+Secrets often live in private config files rather than `.env`. To have GForge
+block staged code that hardcodes a value from one of them, approve the file and
+the keys to read in `~/.gforge/sources.json`:
+
+```json
+{
+  "repositories": [
+    {
+      "path": "/home/me/src/shop",
+      "sources": [
+        { "file": "services/api/config/secrets.local.json", "format": "json", "keys": ["db.password", "stripe.secret"] },
+        { "file": "services/web/application-local.properties", "format": "properties", "keys": ["api.token"] }
+      ]
+    }
+  ]
+}
+```
+
+- `path` is the absolute path of the repository root (its real path, so a moved
+  clone or a separate worktree needs its own entry).
+- `file` is relative to that root. Absolute paths, `..` segments and anything in
+  `.git` are refused, and a file whose real path (after symlinks) leaves the
+  repository is not read.
+- `format` is `json` or `properties`. JSON `keys` are dotted paths
+  (`db.password`, `list.0`); properties `keys` are exact names. YAML and TOML are
+  not supported yet.
+- Files are parsed as data only: no `${...}` expansion, templates, includes or
+  remote lookups. Values that are references (`${VAR}`, `op://…`, `vault://…`),
+  placeholders, or under 10 characters are skipped.
+- Limits: 1 MB per file, 8 MB and 1,000 values per repository, 64 levels of JSON
+  nesting, 50 sources per repository, 100 keys per source.
+
+Nothing in a repository can add an approval, and nothing outside the approved
+files is read. A matching value is reported as `hardcoded-known-secret`; values
+stay in memory and are never printed, stored or hashed. A missing, unreadable,
+malformed or oversized source is named (path and reason only) on each commit and
+by `gforge verify`, while every other layer keeps running. `gforge history` uses
+the files' current values only, so a credential rotated out of them earlier is
+not covered.
 
 ## Scanning existing history
 
@@ -347,9 +391,10 @@ Behavior is controlled through the environment variables below.
 GForge keeps its own state under `~/.gforge` — the managed hooks, an install
 state file, and an update-check cache. Those are managed for you by
 `install` / `update` / `uninstall` and are not meant to be edited by hand, so
-there is nothing to set up before the table below applies. The one file in there
-you may write yourself is `rules.json`, the optional
-[custom rule pack](#custom-rule-packs).
+there is nothing to set up before the table below applies. The files in there
+you may write yourself are `rules.json`, the optional
+[custom rule pack](#custom-rule-packs), and `sources.json`, the optional
+[approved local secret sources](#approved-local-secret-sources).
 
 | Variable | Effect |
 | --- | --- |

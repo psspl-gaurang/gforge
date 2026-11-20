@@ -1,6 +1,11 @@
 import { MIN_NODE_MAJOR } from "./environment.js";
 
-export function createVerificationReport(environment, managedHooksReport = null, dotenvReport = null) {
+export function createVerificationReport(
+  environment,
+  managedHooksReport = null,
+  dotenvReport = null,
+  approvedSourcesReport = null
+) {
   const checks = [
     {
       status: environment.platform.supported ? "PASS" : "FAIL",
@@ -28,7 +33,8 @@ export function createVerificationReport(environment, managedHooksReport = null,
   const allChecks = [
     ...checks,
     ...(managedHooksReport ? managedHooksReport.checks : []),
-    ...dotenvChecks(dotenvReport)
+    ...dotenvChecks(dotenvReport),
+    ...approvedSourceChecks(approvedSourcesReport)
   ];
 
   // A WARN normally means "worth knowing, still protected" — an unsupported
@@ -77,10 +83,34 @@ function dotenvChecks(report) {
   }];
 }
 
-function formatFileList(files, limit = 4) {
+// Approved local secret sources are opt-in (~/.gforge/sources.json), so the
+// check only appears once something is configured. An incomplete source is a
+// WARN, never `blocking`: the other layers still run (issue #130).
+function approvedSourceChecks(report) {
+  if (!report || !report.inRepo || !report.configured) return [];
+  const sources = report.sources ?? [];
+  const errors = report.errors ?? [];
+  if (sources.length === 0 && errors.length === 0) return [];
+
+  const label = "approved-secret-sources";
+  const files = sources.map((source) => source.file);
+  const loaded = `${report.secretCount} value(s) cross-referenced from ${
+    files.length > 0 ? formatFileList(files, 4, "approved sources") : "no approved source for this repository"
+  }`;
+  const incomplete = sources.filter((source) => source.incomplete);
+  if (incomplete.length === 0 && errors.length === 0) {
+    return [{ status: "PASS", label, detail: loaded }];
+  }
+
+  const problems = incomplete.map((source) => `${source.file} (${source.incomplete})`);
+  if (errors.length > 0) problems.push(`${errors.length} problem(s) in ~/.gforge/sources.json`);
+  return [{ status: "WARN", label, detail: `${loaded}; incomplete: ${problems.join(", ")}` }];
+}
+
+function formatFileList(files, limit = 4, noun = "env files") {
   const shown = files.slice(0, limit).join(", ");
   const rest = files.length - limit;
-  return rest > 0 ? `${files.length} env files (${shown}, +${rest} more)` : shown;
+  return rest > 0 ? `${files.length} ${noun} (${shown}, +${rest} more)` : shown;
 }
 
 export function formatVerificationReport(report) {

@@ -47,6 +47,10 @@ GForge manages global Git hook configuration. Security-sensitive areas include:
 - Hook installation and update behavior.
 - Global Git configuration changes.
 - Secret detection logic.
+- Approved local secret sources: approvals are read only from
+  `~/.gforge/sources.json`, never from a repository, and reads must stay inside
+  the approved repository's real root. A repository that can add a trusted
+  source, or make GForge read outside that boundary, is in scope.
 - Logging output.
 - Uninstall behavior.
 

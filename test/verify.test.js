@@ -193,3 +193,50 @@ function healthyEnvironment() {
     git: { available: true, rawVersion: "git version 2.45.0" }
   };
 }
+
+test("issue #130: approved secret sources are reported by path and count, and only when configured", () => {
+  const source = (file, extra = {}) => ({ file, format: "json", keys: 1, count: 1, missing: 0, skipped: 0, incomplete: null, ...extra });
+  const healthy = createVerificationReport(healthyEnvironment(), null, null, {
+    configured: true,
+    inRepo: true,
+    sources: [source("api/config/local.json"), source("web/local.properties", { format: "properties" })],
+    errors: [],
+    secretCount: 2
+  });
+  assert.equal(healthy.exitCode, 0);
+  assert.match(
+    formatVerificationReport(healthy),
+    /PASS approved-secret-sources: 2 value\(s\) cross-referenced from api\/config\/local\.json, web\/local\.properties/
+  );
+
+  const incomplete = createVerificationReport(healthyEnvironment(), null, null, {
+    configured: true,
+    inRepo: true,
+    sources: [source("local.json"), source("gone.json", { count: 0, incomplete: "not found" })],
+    errors: ["repository 1 source 3: file must not contain .. segments"],
+    secretCount: 1
+  });
+  // Informational: the other layers still run, so this never fails verify.
+  assert.equal(incomplete.exitCode, 0);
+  assert.deepEqual(incomplete.blocking, []);
+  assert.match(
+    formatVerificationReport(incomplete),
+    /WARN approved-secret-sources: 1 value\(s\) cross-referenced from local\.json, gone\.json; incomplete: gone\.json \(not found\), 1 problem\(s\) in ~\/\.gforge\/sources\.json/
+  );
+
+  const invalidOnly = createVerificationReport(healthyEnvironment(), null, null, {
+    configured: true, inRepo: true, sources: [], errors: ["not valid JSON"], secretCount: 0
+  });
+  assert.match(formatVerificationReport(invalidOnly), /WARN approved-secret-sources: 0 value\(s\) cross-referenced from no approved source/);
+
+  // Opt-in: nothing configured, nothing approved here, or outside a repo.
+  for (const report of [
+    { configured: false, inRepo: true, sources: [], errors: [], secretCount: 0 },
+    { configured: true, inRepo: true, sources: [], errors: [], secretCount: 0 },
+    { configured: true, inRepo: false, sources: [], errors: ["x"], secretCount: 0 },
+    null
+  ]) {
+    const checks = createVerificationReport(healthyEnvironment(), null, null, report).checks;
+    assert.equal(checks.some((c) => c.label === "approved-secret-sources"), false);
+  }
+});
