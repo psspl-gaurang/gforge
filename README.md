@@ -118,6 +118,7 @@ gforge <command> [--force]
 | --- | --- |
 | `gforge install` | Upgrade to the latest version (if any) and install the global hooks. |
 | `gforge verify` | Read-only health check of the environment, the installed hooks, and (inside a repo) the `.env` files the cross-reference can see. |
+| `gforge probe` | Opt-in check that runs the verified hook against one disposable repository. See [Protection probe](#protection-probe). |
 | `gforge history` | Scan the current repository's existing commit history for secrets committed before GForge was installed. Read-only. See [Scanning existing history](#scanning-existing-history). |
 | `gforge update` | Upgrade to the latest version (if any) and refresh the hooks. |
 | `gforge uninstall` | Remove GForge-owned hooks and restore your previous Git config. |
@@ -126,6 +127,34 @@ gforge <command> [--force]
 
 `--force` (with `install`/`update`) reinstalls the latest release even if you are
 already on it. GForge never downgrades below your installed version.
+
+### Protection probe
+
+`gforge verify` is read-only. It inspects the environment, the installed hooks,
+and configuration. It does not create a repository and it does not run a commit.
+`gforge probe` is a separate opt-in check. It confirms the installed `pre-commit`
+hook and `gforge-scan.mjs` are byte-for-byte the current GForge files, copies only
+those two files into a disposable repository, and commits one clean file and one
+synthetic credential through a linked worktree.
+
+The probe refuses to run if either file is stale, modified, or not GForge's, or
+if any other executable is in the hooks directory. It does not execute repository
+hooks, signing programs, filters, or third-party hook commands. It does not make
+network or update installs. Writes stay in one temporary directory, which is
+removed afterward, including if the check is interrupted. Global Git config and
+the installed hooks are left unchanged.
+
+A successful probe covers one disposable repository, one clean file, one
+synthetic credential, the copied verified hook, and this process environment. It
+does not prove every repository or GUI environment is protected. It does not
+prove other repositories, a GUI client, a symlinked `core.hooksPath`, a local or
+system hooks override, custom rules, or gitleaks. The gitleaks layer is not
+exercised, and custom rules are not loaded.
+
+The command exits 0 only when the clean change is allowed and the synthetic
+credential is blocked with a GForge block report. A missing Node runtime, an
+inert hook, both commits blocked, a signal, a null status, or any other exit is
+reported on its own and exits non-zero.
 
 ## How detection works
 
