@@ -17,6 +17,7 @@ import {
 import { formatHistoryReport, scanHistory } from "./history.js";
 import { describeDotenvSources } from "./scanner.js";
 import { runSettingsCommand } from "./settings.js";
+import { runProtectionProbe } from "./protection-probe.js";
 import { createVerificationReport, formatVerificationReport } from "./verify.js";
 
 export async function runCli(args, streams, options = {}) {
@@ -63,8 +64,26 @@ export async function runCli(args, streams, options = {}) {
     return { exitCode: report.exitCode };
   }
 
+  // Opt-in and separate from verify. verify stays a read-only report; probe is
+  // the command that creates a disposable repository and runs a commit.
+  if (command === "probe") {
+    return runProbe(options, streams);
+  }
+
   streams.stderr.write(`${banner(streams.stderr)}Unknown command: ${command}\n\n${helpText(streams.stderr)}`);
   return { exitCode: 1 };
+}
+
+async function runProbe(options, streams) {
+  try {
+    const outcome = await (options.runProtectionProbe ?? runProtectionProbe)(options);
+    streams.stdout.write(outcome.report ?? "");
+    return { exitCode: outcome.exitCode ?? 1 };
+  } catch (error) {
+    const detail = error?.message ?? String(error);
+    streams.stderr.write(`GForge probe failed\n\n${detail}\n`);
+    return { exitCode: 1 };
+  }
 }
 
 // Read-only: scans what is already committed, reports, and changes nothing.
@@ -234,6 +253,7 @@ function helpText(stream) {
     header("Commands:"),
     row("install", "Upgrade to the latest version (if any) and install the hooks"),
     row("verify", "Verify the environment and installed hooks (read-only)"),
+    row("probe", "Opt-in: run the verified hook on a disposable repository"),
     row("history", "Scan this repo's commit history for secrets; --all, --no-allowlist"),
     row("update", "Upgrade to the latest version (if any) and refresh the hooks"),
     row("uninstall", "Remove GForge-owned hooks and restore your Git config"),

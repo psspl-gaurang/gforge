@@ -365,3 +365,61 @@ test("issue #32: a healthy environment still upgrades, and is detected only once
   assert.deepEqual(order, ["detectEnvironment", "network:getLatestVersion", "installManagedHooks"]);
   assert.equal(detections, 1);
 });
+
+test("help lists the opt-in probe separately from read-only verify", async () => {
+  const streams = createStreams();
+  const result = await runCli(["help"], streams);
+
+  assert.equal(result.exitCode, 0);
+  assert.match(streams.stdout.value, /verify\s+Verify the environment and installed hooks \(read-only\)/);
+  assert.match(streams.stdout.value, /probe\s+Opt-in: run the verified hook on a disposable repository/);
+});
+
+test("probe is an opt-in command and does not run as part of verify", async () => {
+  const streams = createStreams();
+  let probed = false;
+  const result = await runCli(["probe"], streams, {
+    runProtectionProbe: async () => {
+      probed = true;
+      return { exitCode: 0, report: "GForge protection probe\nresult: protected\n" };
+    }
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(probed, true);
+  assert.match(streams.stdout.value, /result: protected/);
+  assert.equal(streams.stderr.value, "");
+});
+
+test("verify does not run the protection probe, git init, or git commit", async () => {
+  const calls = [];
+  let probed = false;
+  const streams = createStreams();
+  const home = "/tmp/gforge-verify-does-not-write";
+  const result = await runCli(["verify"], streams, {
+    readCachedUpdateNotice: () => null,
+    describeDotenvSources: () => ({ inRepo: false, root: null, files: [], secretCount: 0 }),
+    detectEnvironment: async () => ({
+      platform: { name: "linux", arch: "x64", supported: true, isWsl: false },
+      home: { path: home, present: true },
+      shell: { path: "/bin/bash", name: "bash", supported: true },
+      node: { version: "20.11.0", major: 20, supported: true },
+      git: { available: true, version: "2.45.0", rawVersion: "git version 2.45.0" }
+    }),
+    execFile: async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      const error = new Error("unset");
+      error.code = 1;
+      throw error;
+    },
+    runProtectionProbe: async () => {
+      probed = true;
+      return { exitCode: 0, report: "should not run\n" };
+    }
+  });
+
+  assert.equal(probed, false);
+  assert.equal(calls.some((line) => /\bgit init\b/.test(line) || /\bcommit\b/.test(line)), false);
+  assert.match(streams.stdout.value, /GForge read-only verification/);
+  assert.equal(result.exitCode, 1);
+});
