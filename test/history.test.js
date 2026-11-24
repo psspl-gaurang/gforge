@@ -314,6 +314,32 @@ test("issue #88: a partial clone reports what it lacks, and downloads nothing", 
   assert.notEqual(present.status, 0, "the scan must not have downloaded the blob");
 });
 
+test("issue #88: a partial clone still scans the versions it has", async () => {
+  // Older git aborts a size lookup at the first missing blob; the versions that
+  // are present must still be scanned, whatever order the missing ones come in.
+  const origin = await makeRepo();
+  origin.git(["config", "uploadpack.allowFilter", "true"]);
+  await origin.write("cfg.txt", "v1\n");
+  origin.commit("one");
+  await origin.write("cfg.txt", "v2\n");
+  origin.commit("two");
+  await origin.write("cfg.txt", `${LEAK_LIVE}\n`);
+  origin.commit("three");
+
+  const clone = join(origin.root, "clone");
+  const cloned = spawnSync("git", ["clone", "-q", "--filter=blob:none", `file://${origin.repo}`, clone], {
+    env: { ...process.env, GIT_CONFIG_GLOBAL: join(origin.root, "gitconfig"), GIT_CONFIG_NOSYSTEM: "1" },
+    encoding: "utf8"
+  });
+  assert.equal(cloned.status, 0, cloned.stderr);
+
+  const result = scanHistory({ cwd: clone, home: origin.home, dotenvSecrets: [] });
+  assert.equal(result.unavailableCount, 2);
+  assert.equal(result.scannedCount, 1);
+  assert.ok(result.findings.length > 0);
+  assert.ok(result.findings.every((f) => f.file === "cfg.txt"));
+});
+
 test("issue #88: a shallow clone is flagged as incomplete", async () => {
   const origin = await makeRepo();
   await origin.write("a.txt", "1\n");
