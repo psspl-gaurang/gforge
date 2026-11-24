@@ -105,11 +105,25 @@ export function parseRawLog(output) {
 function readSizes(cwd, blobs) {
   const sizes = new Map();
   if (blobs.length === 0) return sizes;
+  const wanted = new Set(blobs);
+  const collect = (stdout) => {
+    for (const line of stdout.toString("utf8").split("\n")) {
+      const [sha, type, size] = line.split(" ");
+      if (sha && type === "blob" && wanted.has(sha)) sizes.set(sha, Number(size));
+    }
+  };
+
   const result = git(cwd, ["cat-file", "--batch-check"], `${blobs.join("\n")}\n`);
-  for (const line of result.stdout.toString("utf8").split("\n")) {
-    const [sha, type, size] = line.split(" ");
-    if (sha && type === "blob") sizes.set(sha, Number(size));
+  if (result.status === 0) {
+    collect(result.stdout);
+    return sizes;
   }
+
+  // Older git (before 2.44) aborts at the first object a partial clone lacks
+  // instead of printing "missing", which would hide every later blob too. Ask
+  // for the objects that exist locally instead; this never fetches.
+  const local = git(cwd, ["cat-file", "--batch-all-objects", "--batch-check"]);
+  if (local.status === 0) collect(local.stdout);
   return sizes;
 }
 
